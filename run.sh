@@ -18,6 +18,8 @@ qemu-system-aarch64 \
     -netdev vmnet-shared,id=net1,start-address=172.16.0.1,end-address=172.31.255.254,subnet-mask=255.240.0.0 \
     `# Realtime Clock settings settings. PL031 linux driver is required` \
     -rtc base=utc,clock=host \
+    `# RNG support` \
+    -device virtio-rng-pci \
     `# Linux kernel settings` \
     -kernel ./Image \
     -append "console=hvc0 reboot=t root=/dev/vda rw panic=-1"

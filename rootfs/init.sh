@@ -32,16 +32,8 @@ mount_check "none" "/sys/fs/cgroup" "cgroup"
 hostname "microvm"
 
 # Configuring network
-ifconfig eth0 up
-ifconfig eth0 172.16.0.100/16
+ifconfig eth0 172.16.0.100 netmask 255.240.0.0
 route add default gw 172.16.0.1
+ifconfig eth0 up
 
-exec /bin/bash
-
-# Ctrl-C handler
-shutdown_handler() {
-    echo "Shutting down..."
-    exit 0
-}
-
-trap 'shutdown_handler' INT TERM
+/bin/bash
