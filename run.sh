@@ -9,7 +9,9 @@ qemu-system-aarch64 \
     `# Serial port settings` \
     -device virtio-serial-device \
     -chardev stdio,id=virtiocon0 \
+    -chardev socket,path=./console,server=on,wait=off,id=pty1 \
     -device virtconsole,chardev=virtiocon0 \
+    -device virtconsole,chardev=pty1 \
     `# Disk drive settings` \
     -drive id=root,file=rootfs.qcow2,format=qcow2,if=none \
     -device virtio-blk-device,drive=root \
