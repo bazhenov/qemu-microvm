@@ -1,0 +1,5 @@
+/linux-*.tar.xz
+/linux-*/
+/rootfs.*
+/Image
+/rootfs/init
