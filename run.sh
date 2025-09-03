@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 
-qemu-system-aarch64 \
+exec qemu-system-aarch64 \
     `# General settings` \
     -accel hvf -M virt \
-    -nodefaults -no-user-config -nographic -no-reboot \
+    -nodefaults -no-user-config -nographic \
     `# CPU settings` \
     -cpu host -smp cpus=1,sockets=1,cores=1,threads=1 \
     `# Serial port settings` \
     -device virtio-serial-device \
     -chardev stdio,id=virtiocon0 \
-    -chardev socket,path=./console,server=on,wait=off,id=pty1 \
+    -chardev pty,path=./console,id=pty1 \
     -device virtconsole,chardev=virtiocon0 \
     -device virtconsole,chardev=pty1 \
     `# Disk drive settings` \
