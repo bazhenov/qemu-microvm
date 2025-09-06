@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+rm -f ./console
+
 exec qemu-system-aarch64 \
     `# General settings` \
     -accel hvf -M virt \
