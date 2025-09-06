@@ -10,16 +10,17 @@ exec qemu-system-aarch64 \
     -cpu host -smp cpus=1,sockets=1,cores=1,threads=1 \
     `# Serial port settings` \
     -device virtio-serial-device \
-    -chardev stdio,id=virtiocon0 \
-    -chardev pty,path=./console,id=pty1 \
+    -chardev stdio,signal=off,mux=on,id=virtiocon0 \
     -device virtconsole,chardev=virtiocon0 \
+    -chardev pty,path=./console,id=pty1 \
     -device virtconsole,chardev=pty1 \
+    -mon chardev=virtiocon0,mode=readline \
     `# Disk drive settings` \
     -drive id=root,file=rootfs.qcow2,format=qcow2,if=none \
     -device virtio-blk-device,drive=root \
     `# Network settings` \
     -device virtio-net-device,netdev=net1 \
-    -netdev vmnet-shared,id=net1,start-address=172.16.0.1,end-address=172.31.255.254,subnet-mask=255.240.0.0 \
+    -netdev user,id=net1 \
     `# Realtime Clock settings settings. PL031 linux driver is required` \
     -rtc base=utc,clock=host \
     `# RNG support` \
