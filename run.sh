@@ -29,4 +29,4 @@ exec qemu-system-aarch64 \
         -device virtio-rng-pci \
     `# Linux kernel settings` \
         -kernel ./Image \
-        -append "console=hvc0 reboot=t root=/dev/vda rw panic=-1"
+        -append "console=hvc0 console=hvc1 reboot=t root=/dev/vda rw panic=-1"
