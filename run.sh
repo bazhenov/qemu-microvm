@@ -27,6 +27,10 @@ exec qemu-system-aarch64 \
         -rtc base=utc,clock=host \
     `# RNG support` \
         -device virtio-rng-pci \
+    `# VirtIO FS` \
+        -virtfs local,path=/Users/bazhenov/Developer/qemu-microvm,mount_tag=qemu,security_model=mapped \
+    `# mount -t 9p -o trans=virtio qemu /mnt -oversion=9p2000.L ` \
+    `# Kernel must be compiled with approriate options. See. https://wiki.qemu.org/Documentation/9psetup` \
     `# Linux kernel settings` \
         -kernel ./Image \
         -append "console=hvc0 console=hvc1 reboot=t root=/dev/vda rw panic=-1"
