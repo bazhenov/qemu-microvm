@@ -2,6 +2,7 @@ use nix::unistd::execv;
 use std::{
     ffi::CStr,
     fs::{self, create_dir},
+    os::unix::fs::chroot,
     process::exit,
 };
 use sys_mount::{Mount, MountFlags, SupportedFilesystems, Unmount, UnmountFlags};
@@ -32,7 +33,8 @@ fn main() {
         eprintln!("Failed to mount: {e}");
     }
 
-    println!("Exist: {:?}", fs::exists("/mnt/sbin/init"));
+    chroot("/mnt").expect("Failed to chroot into /mnt");
 
-    unsafe { execv::<&'static CStr>(c"/mnt/sbin/init", &[]) };
+    println!("Exist: {:?}", fs::exists("/sbin/init"));
+    unsafe { execv::<&'static CStr>(c"/sbin/init", &[]) };
 }

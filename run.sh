@@ -4,10 +4,12 @@ rm -f ./console
 
 exec qemu-system-aarch64 \
     `# General settings. Using Hypervisor.framework` \
-        -accel hvf -M virt \
+        `#-cpu cortex-a72` \
+    `# General settings. Emulation` \
+        -accel hvf -cpu host \
         -nodefaults -no-user-config -nographic -no-reboot \
     `# CPU settings` \
-        -cpu host -smp cpus=1,sockets=1,cores=1,threads=1 \
+        -M virt -smp cpus=1,sockets=1,cores=1,threads=1 \
     `# Serial port settings` \
         -device virtio-serial-device \
     `# hvc0 serial device with QEMU monitor in a multiplexed mode` \
@@ -34,4 +36,4 @@ exec qemu-system-aarch64 \
     `# Linux kernel settings` \
         -kernel ./Image \
         -initrd initrd.gz \
-        -append "console=hvc0 console=hvc1 reboot=t root=/dev/vda rdinit=/init panic=-1"
+        -append "console=hvc0 console=hvc1 reboot=t rdinit=/init panic=-1"

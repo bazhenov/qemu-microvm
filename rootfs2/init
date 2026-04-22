@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+mount -t proc proc /proc
+mount -t sysfs proc /sys
+mount -t devtmpfs devtmpfs /dev
+
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.2
+
+mkdir /mnt
+mount /dev/vda /mnt
+
+if grep -qw "init_recovery" /proc/cmdline; then
+    exec /bin/sh
+else
+    # switch_root must be executed with PID=1, hence exec
+    exec switch_root /mnt /sbin/init
+fi
