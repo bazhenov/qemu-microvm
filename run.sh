@@ -5,7 +5,7 @@ rm -f ./console
 exec qemu-system-aarch64 \
     `# General settings. Using Hypervisor.framework` \
         -accel hvf -M virt \
-        -nodefaults -no-user-config -nographic \
+        -nodefaults -no-user-config -nographic -no-reboot \
     `# CPU settings` \
         -cpu host -smp cpus=1,sockets=1,cores=1,threads=1 \
     `# Serial port settings` \
@@ -33,4 +33,5 @@ exec qemu-system-aarch64 \
     `# Kernel must be compiled with approriate options. See. https://wiki.qemu.org/Documentation/9psetup` \
     `# Linux kernel settings` \
         -kernel ./Image \
-        -append "console=hvc0 console=hvc1 reboot=t root=/dev/vda rw panic=-1"
+        -initrd initrd.gz \
+        -append "console=hvc0 console=hvc1 reboot=t root=/dev/vda rdinit=/init panic=-1"
