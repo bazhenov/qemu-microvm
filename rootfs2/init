@@ -15,7 +15,6 @@ ip addr add 10.0.2.15/24 dev eth0
 ip route add default via 10.0.2.2
 
 ip link set lo up
-
 hostname sandbox
 
 if grep -qw "init_recovery" /proc/cmdline; then
@@ -31,5 +30,18 @@ else
     mount -o move /sys /mnt/sys
     mount -o move /dev /mnt/dev
 
+    # From now on we do not care about exit code. We steel need to move on
+    set +e
     chroot /mnt /usr/bin/setsid -c /usr/bin/env -i TERM=xterm-color /usr/bin/bash --login +h
+
+    # Moving system mounts back
+    mount -o move /mnt/proc /proc
+    mount -o move /mnt/sys /sys
+    mount -o move /mnt/dev /dev
+
+    sync
+    # Filesystems should be unmounted in the opposite order
+    umount /mnt/workspace
+    umount /mnt
+    poweroff -f
 fi
