@@ -13,7 +13,7 @@ exec qemu-system-aarch64 \
         `#-cpu cortex-a72` \
         -nodefaults -no-user-config -nographic -no-reboot \
     `# CPU settings` \
-        -M virt -smp cpus=1,sockets=1,cores=1,threads=1 -m 512M \
+        -M virt -smp cpus=4,sockets=1,cores=4,threads=1 -m 512M \
     `# Serial port settings` \
         -device virtio-serial-device \
     `# hvc0 serial device with QEMU monitor in a multiplexed mode` \
