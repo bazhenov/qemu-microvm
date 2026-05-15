@@ -2,11 +2,15 @@
 
 rm -f ./console
 
+if [[ ! -f ./rootfs-overlay.qcow2 ]]; then
+    qemu-img create -o backing_file=rootfs.qcow2,backing_fmt=qcow2 -f qcow2 rootfs-overlay.qcow2
+fi
+
 exec qemu-system-aarch64 \
     `# General settings. Using Hypervisor.framework` \
-        `#-cpu cortex-a72` \
-    `# General settings. Emulation` \
         -accel hvf -cpu host \
+    `# General settings. Emulation` \
+        `#-cpu cortex-a72` \
         -nodefaults -no-user-config -nographic -no-reboot \
     `# CPU settings` \
         -M virt -smp cpus=1,sockets=1,cores=1,threads=1 \
@@ -20,7 +24,7 @@ exec qemu-system-aarch64 \
         -chardev pty,path=./console,id=console-hvc1 \
         -device virtconsole,chardev=console-hvc1 \
     `# Root disk drive` \
-        -drive id=root,file=rootfs.qcow2,format=qcow2,if=none \
+        -drive id=root,file=rootfs-overlay.qcow2,format=qcow2,if=none \
         -device virtio-blk-device,drive=root \
     `# Network` \
         -device virtio-net-device,netdev=net1 \
@@ -30,8 +34,8 @@ exec qemu-system-aarch64 \
     `# RNG support` \
         -device virtio-rng-pci \
     `# VirtIO FS` \
-        -virtfs local,path=/Users/bazhenov/Developer/qemu-microvm,mount_tag=qemu,security_model=mapped \
-    `# mount -t 9p -o trans=virtio qemu /mnt -oversion=9p2000.L ` \
+        -virtfs local,path="$PWD",mount_tag=qemu,security_model=mapped \
+    `# mount -t 9p -o trans=virtio qemu /mnt -oversion=9p2000.L,msize=512k ` \
     `# Kernel must be compiled with approriate options. See. https://wiki.qemu.org/Documentation/9psetup` \
     `# Linux kernel settings` \
         -kernel ./Image \
