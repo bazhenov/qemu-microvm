@@ -24,3 +24,7 @@ nix = { version = "0.31.3", features = ["term"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 signal-hook = "0.3"
+
+[dev-dependencies]
+regex = "1.12.4"
+tempdir = "0.3.7"

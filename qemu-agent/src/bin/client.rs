@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     let path = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
-            // eprintln!("usage: client <channel-device>");
+            eprintln!("usage: client <channel-device>");
             return ExitCode::from(2);
         }
     };
@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     match run(&path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // eprintln!("client: {e}");
+            eprintln!("client: {e}");
             ExitCode::FAILURE
         }
     }
@@ -123,7 +123,7 @@ fn output_loop(reader_file: File) {
                 }
             }
             Ok(frame) => {
-                // eprintln!("Unknown frame {frame:?}");
+                eprintln!("Unknown frame {frame:?}");
             }
             Err(_) => break,
         }
@@ -150,10 +150,12 @@ fn input_loop(writer: Arc<Mutex<File>>) {
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("input_loop() = {e}");
+                break;
+            }
         }
     }
-    // eprintln!("input_loop() finished")
 }
 
 /// Re-query the terminal size on every SIGWINCH and forward it.

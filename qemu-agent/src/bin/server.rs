@@ -6,7 +6,6 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
-use std::env;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -17,6 +16,7 @@ use std::process::ExitCode;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::{env, io};
 
 use nix::sys::termios;
 use qemu_agent::{Endpoint, Frame, FrameReader, MAX_PAYLOAD};
@@ -30,7 +30,10 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(&path) {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // eprintln!("server: {e}");
@@ -39,20 +42,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(_path: &str) -> std::io::Result<()> {
+fn run(cmd: &[&str]) -> io::Result<()> {
     // The channel is read and written from different threads. Open once and
     // dup the fd so the reader can own its half while the writers share theirs.
     // _slave needs to be bounded, otherwise pty will be closed
     let (client_channel, _slave, name) = open_pty()?;
-    eprintln!("Communication pty: {name:?}");
+    configure_raw_pty(&client_channel)?;
+    std::os::unix::fs::symlink(name, "./tty").unwrap();
     let client_channel = File::from(client_channel);
-    // let channel = File::options().read(true).write(true).open(path)?;
     let channel_writer = client_channel.try_clone()?;
     let channel_fd = client_channel.as_raw_fd();
     let mut client_channel_reader = FrameReader::new(client_channel);
 
     let (master, slave, _) = open_pty()?;
-    let (stderr_r, stderr_w) = pipe()?;
 
     if let Ok(current_tty) = File::open("/dev/tty") {
         // If there is current terminal, copying setattr from it
@@ -63,8 +65,6 @@ fn run(_path: &str) -> std::io::Result<()> {
     // Raw fds the child must close so it doesn't inherit the channel/master.
     let master_fd = master.as_raw_fd();
     let slave_fd = slave.as_raw_fd();
-    let stderr_r_fd = stderr_r.as_raw_fd();
-    let stderr_w_fd = stderr_w.as_raw_fd();
 
     // The server blocks until the client announces its terminal size. Any
     // stdin bytes that arrive before the first resize are buffered and
@@ -83,11 +83,9 @@ fn run(_path: &str) -> std::io::Result<()> {
                 }
                 // Other endpoints before the shell exists: drop.
             }
-            Some(Err(e)) => return Err(std::io::Error::other(format!("decode: {e}"))),
+            Some(Err(e)) => return Err(io::Error::other(format!("decode: {e}"))),
             None => {
-                return Err(std::io::Error::other(
-                    "channel closed before initial resize",
-                ));
+                return Err(io::Error::other("channel closed before initial resize"));
             }
         }
     };
@@ -96,26 +94,28 @@ fn run(_path: &str) -> std::io::Result<()> {
 
     // Build exec arguments and environment before forking so the child does
     // no allocation between fork() and execvpe() beyond the pointer arrays.
-    let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    let prog = cstr(shell.as_os_str());
-    let argv: Vec<CString> = vec![prog.clone(), cstr(OsString::from("-li").as_os_str())];
+    let argv = cmd
+        .iter()
+        .copied()
+        .map(str::as_bytes)
+        .map(CString::new)
+        .collect::<Result<Vec<_>, _>>()?;
     let envp = build_env();
-    eprintln!("Spawning: {:?}", shell);
+    eprintln!("Spawning: {:?}", argv);
 
     let child = unsafe { libc::fork() };
     if child < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     if child == 0 {
         // ---- child ----
-        let close_in_child = [channel_fd, master_fd, stderr_r_fd];
-        exec_shell(slave_fd, stderr_w_fd, &close_in_child, &prog, &argv, &envp);
+        let close_in_child = [channel_fd, master_fd];
+        exec_shell(slave_fd, &close_in_child, &argv[0], &argv, &envp);
         // exec_shell never returns.
     } else {
         // ---- parent ----
         // Hand the slave end and the pipe's write end to the child only.
         drop(slave);
-        drop(stderr_w);
 
         let mut master_writer = File::from(master);
         if !pending.is_empty() {
@@ -123,7 +123,6 @@ fn run(_path: &str) -> std::io::Result<()> {
             master_writer.flush()?;
         }
         let master_reader = master_writer.try_clone()?;
-        let stderr_reader = File::from(stderr_r);
 
         let sink = Arc::new(Mutex::new(channel_writer));
 
@@ -137,17 +136,12 @@ fn run(_path: &str) -> std::io::Result<()> {
             thread::spawn(move || pump_to_channel(master_reader, Endpoint::Stdout as u8, sink))
         };
 
-        // stderr pipe -> channel as stderr frames.
-        let t_err =
-            thread::spawn(move || pump_to_channel(stderr_reader, Endpoint::Stderr as u8, sink));
-
         // Reap the shell. When it dies the PTY master and stderr pipe hit EOF and
         // the output threads finish; the input thread may still be blocked on the
         // channel, so we exit the process rather than joining it.
         // eprintln!("Waiting for exit");
         let _ = wait_for(child);
         let _ = t_out.join();
-        let _ = t_err.join();
         drop(t_in);
         Ok(())
     }
@@ -196,7 +190,7 @@ fn pump_to_channel(mut src: File, endpoint: u8, sink: Arc<Mutex<File>>) {
                     break;
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -209,7 +203,6 @@ fn pump_to_channel(mut src: File, endpoint: u8, sink: Arc<Mutex<File>>) {
 /// single-threaded at this point (threads are spawned after the fork).
 fn exec_shell(
     slave_fd: RawFd,
-    stderr_w_fd: RawFd,
     close_fds: &[RawFd],
     prog: &CString,
     argv: &[CString],
@@ -235,9 +228,6 @@ fn exec_shell(
         }
         if slave_fd > libc::STDERR_FILENO {
             libc::close(slave_fd);
-        }
-        if stderr_w_fd > libc::STDERR_FILENO {
-            libc::close(stderr_w_fd);
         }
 
         let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
@@ -266,13 +256,31 @@ fn build_env() -> Vec<CString> {
     env
 }
 
-/// `openpty(3)` wrapper returning owned master/slave fds.
-fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd, PathBuf)> {
-    use nix::sys::termios;
+/// Enabling raw mode for master and slave to make it behave like a serial port/pipe
+///
+/// PTY's are not pipes or serial ports. There is a thing called Line Discipline that it applied
+/// to every PTY in the kernel. It does several things:
+///
+/// - buffers input, so that it's available on counterparty only after newline is recieved
+/// - treats some characters in a special way (Ctrl+C sends SIGINT to a process group session leader, etc)
+///
+/// Because here we just want to use PTY as a full duplex pipe (otherwise we would need to create 2 pipes)
+/// we want to disable all this machinery.
+fn configure_raw_pty(tty: &OwnedFd) -> io::Result<()> {
+    let mut tio = termios::tcgetattr(tty)?;
+    termios::cfmakeraw(&mut tio);
+    termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
+    Ok(())
+}
 
+/// `openpty(3)` wrapper returning owned master/slave fds.
+fn open_pty() -> io::Result<(OwnedFd, OwnedFd, PathBuf)> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
+    #[cfg(target_os = "macos")]
     let mut name = vec![0i8; 256];
+    #[cfg(target_os = "linux")]
+    let mut name = vec![0u8; 256];
     let rc = unsafe {
         libc::openpty(
             &mut master,
@@ -286,39 +294,12 @@ fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd, PathBuf)> {
         .to_string_lossy()
         .to_string();
     if rc < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
 
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
-    // Enabling raw mode for master and slave to make it behave like a serial port/pipe
-    //
-    // PTY's are not pipes or serial ports. There is a thing called Line Discipline that it applied
-    // to every PTY in the kernel. It does several things:
-    //
-    // - buffers input, so that it's available on counterparty only after newline is recieved
-    // - treats some characters in a special way (Ctrl+C sends SIGINT to a process group session leader, etc)
-    //
-    // Because here we just want to use PTY as a full duplex pipe (otherwise we would need to create 2 pipes)
-    // we want to disable all this machinery.
-    let mut tio = termios::tcgetattr(&slave)?;
-    termios::cfmakeraw(&mut tio);
-    termios::tcsetattr(&slave, termios::SetArg::TCSANOW, &tio)?;
-
-    let mut tio = termios::tcgetattr(&master)?;
-    termios::cfmakeraw(&mut tio);
-    termios::tcsetattr(&master, termios::SetArg::TCSANOW, &tio)?;
-
     Ok((master, slave, PathBuf::from(pty_name)))
-}
-
-/// `pipe(2)` wrapper returning owned (read, write) fds.
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Apply a terminal size to a PTY via `TIOCSWINSZ`.
@@ -335,10 +316,10 @@ fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
 }
 
 /// Block until the given child changes state.
-fn wait_for(pid: libc::pid_t) -> std::io::Result<()> {
+fn wait_for(pid: libc::pid_t) -> io::Result<()> {
     let mut status = 0;
     if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -360,6 +341,7 @@ mod tests {
     #[test]
     fn openpty_mirroring() {
         let (master, slave, _) = open_pty().unwrap();
+        configure_raw_pty(&master).unwrap();
 
         let mut master = File::from(master);
         let mut slave = File::from(slave);
