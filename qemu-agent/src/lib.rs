@@ -15,8 +15,12 @@
 //! `payload_len` does not include the 3-byte header. The channel is assumed
 //! reliable: no CRC, no magic byte, no resync.
 
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    os::fd::AsFd,
+};
 
+use nix::sys::termios;
 use thiserror::Error;
 
 /// Maximum size of a whole frame on the wire (header + payload).
@@ -182,6 +186,23 @@ impl<R: Read> Iterator for FrameReader<R> {
             Err(e) => Some(Err(e.into())),
         }
     }
+}
+
+/// Enabling raw mode for master and slave to make it behave like a serial port/pipe
+///
+/// PTY's are not pipes or serial ports. There is a thing called Line Discipline that it applied
+/// to every PTY in the kernel. It does several things:
+///
+/// - buffers input, so that it's available on counterparty only after newline is recieved
+/// - treats some characters in a special way (Ctrl+C sends SIGINT to a process group session leader, etc)
+///
+/// Because here we just want to use PTY as a full duplex pipe (otherwise we would need to create 2 pipes)
+/// we want to disable all this machinery.
+pub fn configure_raw_pty(tty: &impl AsFd) -> io::Result<()> {
+    let mut tio = termios::tcgetattr(tty)?;
+    termios::cfmakeraw(&mut tio);
+    termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
+    Ok(())
 }
 
 #[cfg(test)]

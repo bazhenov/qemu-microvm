@@ -7,7 +7,7 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 //! `Ctrl-]` then `q` disconnects locally.
 
-use qemu_agent::{Endpoint, Frame, FrameReader, MAX_PAYLOAD};
+use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use std::fs::File;
@@ -57,6 +57,7 @@ impl Drop for RawGuard {
 
 fn run(path: &str) -> io::Result<()> {
     let channel = File::options().read(true).write(true).open(path)?;
+    configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
     let writer = Arc::new(Mutex::new(channel));
 
@@ -122,13 +123,13 @@ fn output_loop(reader_file: File) {
                     break;
                 }
             }
-            Ok(frame) => {
-                eprintln!("Unknown frame {frame:?}");
+            Ok(frame) => eprintln!("Unknown frame endpoint = {}", frame.endpoint),
+            Err(e) => {
+                eprintln!("output_loop() = {e:?}");
+                break;
             }
-            Err(_) => break,
         }
     }
-    // eprintln!("output_loop() finished")
 }
 
 /// Read raw stdin, filter the local escape sequence, forward the rest.
@@ -140,7 +141,6 @@ fn input_loop(writer: Arc<Mutex<File>>) {
         match stdin.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // eprintln!("Input loop fired");
                 let (payload, quit) = filter_escape(&buf[..n], &mut escaped);
                 if !payload.is_empty() && send_frame(&writer, &Frame::stdin(payload)).is_err() {
                     break;

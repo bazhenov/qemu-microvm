@@ -6,10 +6,10 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,14 +19,15 @@ use std::thread;
 use std::{env, io};
 
 use nix::sys::termios;
-use qemu_agent::{Endpoint, Frame, FrameReader, MAX_PAYLOAD};
+use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 
 fn main() -> ExitCode {
     let (client_channel, _slave) = match env::var_os("TTY_PATH") {
-        Some(p) => (
-            OpenOptions::new().write(true).read(true).open(p).unwrap(),
-            None,
-        ),
+        Some(p) => {
+            let fd = OpenOptions::new().write(true).read(true).open(p).unwrap();
+            configure_raw_pty(&fd).unwrap();
+            (fd, None)
+        }
         None => {
             // The channel is read and written from different threads. Open once and
             // dup the fd so the reader can own its half while the writers share theirs.
@@ -57,11 +58,12 @@ fn run(client_channel: File, cmd: &[&str]) -> io::Result<()> {
 
     let (master, slave, _) = open_pty()?;
 
-    if let Ok(current_tty) = File::open("/dev/tty") {
-        // If there is current terminal, copying setattr from it
-        let tio = termios::tcgetattr(&current_tty)?;
-        termios::tcsetattr(&master, termios::SetArg::TCSANOW, &tio)?;
-    }
+    //if let Ok(current_tty) = File::open("/dev/tty") {
+    //    // If there is current terminal, copying setattr from it
+    //    let tio = termios::tcgetattr(&current_tty)?;
+    //    eprintln!("Settings termio flags: {tio:?}");
+    //    termios::tcsetattr(&master, termios::SetArg::TCSANOW, &tio)?;
+    //}
 
     // Raw fds the child must close so it doesn't inherit the channel/master.
     let master_fd = master.as_raw_fd();
@@ -71,7 +73,7 @@ fn run(client_channel: File, cmd: &[&str]) -> io::Result<()> {
     // stdin bytes that arrive before the first resize are buffered and
     // flushed once the shell is running.
     let mut pending = Vec::new();
-    // eprintln!("Waiting for size...");
+    eprintln!("Waiting for size...");
     let (cols, rows) = loop {
         match client_channel_reader.next() {
             Some(Ok(frame)) => {
@@ -90,7 +92,7 @@ fn run(client_channel: File, cmd: &[&str]) -> io::Result<()> {
             }
         }
     };
-    // eprintln!("Size received {cols}x{rows}...");
+    eprintln!("Size received {cols}x{rows}...");
     set_winsize(master_fd, cols, rows);
 
     // Build exec arguments and environment before forking so the child does
@@ -255,23 +257,6 @@ fn build_env() -> Vec<CString> {
         .collect();
     env.push(CString::new("TERM=xterm-256color").unwrap());
     env
-}
-
-/// Enabling raw mode for master and slave to make it behave like a serial port/pipe
-///
-/// PTY's are not pipes or serial ports. There is a thing called Line Discipline that it applied
-/// to every PTY in the kernel. It does several things:
-///
-/// - buffers input, so that it's available on counterparty only after newline is recieved
-/// - treats some characters in a special way (Ctrl+C sends SIGINT to a process group session leader, etc)
-///
-/// Because here we just want to use PTY as a full duplex pipe (otherwise we would need to create 2 pipes)
-/// we want to disable all this machinery.
-fn configure_raw_pty(tty: &OwnedFd) -> io::Result<()> {
-    let mut tio = termios::tcgetattr(tty)?;
-    termios::cfmakeraw(&mut tio);
-    termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
-    Ok(())
 }
 
 /// `openpty(3)` wrapper returning owned master/slave fds.
