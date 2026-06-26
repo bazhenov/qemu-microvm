@@ -14,7 +14,7 @@ const SERVER: &str = env!("CARGO_BIN_EXE_server");
 
 #[test]
 fn md5sum() {
-    run_tty_test(&["/bin/bash", "c", "echo Hi | md5sum"])
+    run_tty_test(&["/bin/bash", "-c", "echo Hi | md5sum"])
         .assert_success()
         .assert_stdout_contains("31ebdfce8b77ac49d7f5506dd1495830");
 }

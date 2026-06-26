@@ -7,7 +7,7 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -22,34 +22,35 @@ use nix::sys::termios;
 use qemu_agent::{Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 
 fn main() -> ExitCode {
-    let path = match env::args().nth(1) {
-        Some(p) => p,
+    let (client_channel, _slave) = match env::var_os("TTY_PATH") {
+        Some(p) => (
+            OpenOptions::new().write(true).read(true).open(p).unwrap(),
+            None,
+        ),
         None => {
-            // eprintln!("usage: server <channel-device>");
-            return ExitCode::from(2);
+            // The channel is read and written from different threads. Open once and
+            // dup the fd so the reader can own its half while the writers share theirs.
+            // _slave needs to be bounded, otherwise pty will be closed
+            let (client_channel, slave, name) = open_pty().unwrap();
+            configure_raw_pty(&client_channel).unwrap();
+            std::os::unix::fs::symlink(name, "./tty").unwrap();
+            (File::from(client_channel), Some(slave))
         }
     };
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
 
-    match run(&args) {
+    match run(client_channel, &args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // eprintln!("server: {e}");
+            eprintln!("server: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(cmd: &[&str]) -> io::Result<()> {
-    // The channel is read and written from different threads. Open once and
-    // dup the fd so the reader can own its half while the writers share theirs.
-    // _slave needs to be bounded, otherwise pty will be closed
-    let (client_channel, _slave, name) = open_pty()?;
-    configure_raw_pty(&client_channel)?;
-    std::os::unix::fs::symlink(name, "./tty").unwrap();
-    let client_channel = File::from(client_channel);
+fn run(client_channel: File, cmd: &[&str]) -> io::Result<()> {
     let channel_writer = client_channel.try_clone()?;
     let channel_fd = client_channel.as_raw_fd();
     let mut client_channel_reader = FrameReader::new(client_channel);
