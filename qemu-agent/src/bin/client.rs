@@ -123,7 +123,11 @@ fn output_loop(reader_file: File) {
                     break;
                 }
             }
-            Ok(frame) => eprintln!("Unknown frame endpoint = {}", frame.endpoint),
+            Ok(frame) => {
+                eprintln!("Unknown frame endpoint = {}", frame.endpoint);
+                break;
+            }
+
             Err(e) => {
                 eprintln!("output_loop() = {e:?}");
                 break;
