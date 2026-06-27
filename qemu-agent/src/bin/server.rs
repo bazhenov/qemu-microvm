@@ -189,12 +189,13 @@ fn pump_to_channel(mut src: File, endpoint: u8, sink: Arc<Mutex<File>>) {
                     Ok(w) => w,
                     Err(_) => break,
                 };
-                if frame.write_to(&mut *w).is_err() || w.flush().is_err() {
-                    break;
-                }
+                frame.write_to(&mut *w).unwrap();
             }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            // Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("pump_to_channel() = {e}");
+                break;
+            }
         }
     }
     // eprintln!("pump_to_channel() finished")
