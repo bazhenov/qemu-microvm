@@ -7,29 +7,40 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 //! `Ctrl-]` then `q` disconnects locally.
 
-use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
+use qemu_agent::{configure_raw_pty, qemu, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::time::Duration;
+use std::{env, thread};
 
 /// `Ctrl-]` — begins the local escape sequence.
 const ESCAPE: u8 = 0x1d;
 
 fn main() -> ExitCode {
-    let path = match std::env::args().nth(1) {
-        Some(p) => p,
-        None => {
-            eprintln!("usage: client <channel-device>");
-            return ExitCode::from(2);
+    let (path, join_handle) = if env::var("LAUNCH_QEMU").is_ok() {
+        let handle = thread::spawn(qemu::launch_vm);
+        while !fs::exists(qemu::CONSOLE).unwrap() {
+            thread::sleep(Duration::from_millis(50));
         }
+        eprintln!("Console found");
+        (qemu::CONSOLE.to_string(), Some(handle))
+    } else if let Some(p) = std::env::args().nth(1) {
+        (p, None)
+    } else {
+        eprintln!("usage: client <channel-device>");
+        return ExitCode::from(2);
     };
 
-    match run(&path) {
+    let result = run(&path);
+    if let Some(handle) = join_handle {
+        let _ = handle.join();
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("client: {e}");
@@ -163,8 +174,12 @@ fn input_loop(writer: Arc<Mutex<File>>) {
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(e) => {
-                eprintln!("input_loop() = {e}");
+                eprintln!("input_loop() = {e} ({})", e.kind());
                 break;
             }
         }

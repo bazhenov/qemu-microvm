@@ -15,13 +15,14 @@
 //! `payload_len` does not include the 3-byte header. The channel is assumed
 //! reliable: no CRC, no magic byte, no resync.
 
+use nix::sys::termios;
 use std::{
     io::{self, Read, Write},
     os::fd::AsFd,
 };
-
-use nix::sys::termios;
 use thiserror::Error;
+
+pub mod qemu;
 
 /// Maximum size of a whole frame on the wire (header + payload).
 pub const MAX_FRAME_SIZE: usize = 16384;

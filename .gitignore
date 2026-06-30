@@ -3,3 +3,5 @@
 /rootfs.*
 /Image
 /rootfs/init
+/qemu-agent/target
+*.qcow2
