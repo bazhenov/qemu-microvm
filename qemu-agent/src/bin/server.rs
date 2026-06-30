@@ -118,24 +118,29 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         // Channel -> child: decode frames, drive the PTY.
         let stdin_handle = {
             let done_tx = done_tx.clone();
-            thread::spawn(move || {
-                let _ = done_tx.send(pump_stdin(client_channel_reader, master_writer));
-            })
+            thread::Builder::new()
+                .name("pump_stdin".into())
+                .spawn(move || {
+                    let _ = done_tx.send(pump_stdin(client_channel_reader, master_writer));
+                })
+                .expect("Unable to spawn thread")
         };
 
         // PTY master -> channel as stdout frames.
         let stdout_handle = {
             let done_tx = done_tx.clone();
-            thread::spawn(move || {
-                let _ = done_tx.send(pump_stdout(master_reader, sink));
-            })
+            thread::Builder::new()
+                .name("pump_stdout".into())
+                .spawn(move || {
+                    let _ = done_tx.send(pump_stdout(master_reader, sink));
+                })
+                .expect("Unable to spawn thread")
         };
 
+        drop(stdin_handle);
         // done_tx dhould be dropped here, otherwise loop will never finish
-        // drop(done_tx);
-        // while let Ok(r) = done_rx.recv() {
-        //     r?;
-        // }
+        drop(done_tx);
+        done_rx.recv().expect("No messages")?;
 
         // Reap the shell. When it dies the PTY master and stderr pipe hit EOF and
         // the output threads finish; the input thread may still be blocked on the
@@ -143,7 +148,6 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         // eprintln!("Waiting for exit");
         let _ = wait_for(child);
         let _ = stdout_handle.join();
-        drop(stdin_handle);
         Ok(())
     }
 }

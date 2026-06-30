@@ -116,7 +116,7 @@ pub fn launch_vm() -> io::Result<()> {
         ])
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
-        // .stdout(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()?;
     let _ = qemu.stderr.take();
     let _ = qemu.stdin.take();

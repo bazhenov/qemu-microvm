@@ -27,7 +27,6 @@ fn main() -> ExitCode {
         while !fs::exists(qemu::CONSOLE).unwrap() {
             thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("Console found");
         (qemu::CONSOLE.to_string(), Some(handle))
     } else if let Some(p) = std::env::args().nth(1) {
         (p, None)
@@ -95,27 +94,37 @@ fn run(path: &str) -> io::Result<()> {
     // Channel -> local stdout/stderr.
     {
         let done = done_tx.clone();
-        thread::spawn(move || {
-            let _ = done.send(output_loop(reader));
-        });
+        thread::Builder::new()
+            .name("output_loop".into())
+            .spawn(move || {
+                let _ = done.send(output_loop(reader));
+            })
+            .expect("Unable to spawn thread");
     }
 
     // Local stdin -> channel.
     {
         let writer = Arc::clone(&writer);
         let done = done_tx.clone();
-        thread::spawn(move || {
-            let _ = done.send(input_loop(writer));
-        });
+        thread::Builder::new()
+            .name("input_loop".into())
+            .spawn(move || {
+                let _ = done.send(input_loop(writer));
+            })
+            .expect("Unable to spawn thread");
     }
 
     // SIGWINCH -> resize frames.
     {
         let writer = Arc::clone(&writer);
         let done = done_tx.clone();
-        thread::spawn(move || {
-            let _ = done.send(resize_loop(writer));
-        });
+        thread::spawn(move || {});
+        thread::Builder::new()
+            .name("resize_loop".into())
+            .spawn(move || {
+                let _ = done.send(resize_loop(writer));
+            })
+            .expect("Unable to spawn thread");
     }
 
     // Block until something ends the session.

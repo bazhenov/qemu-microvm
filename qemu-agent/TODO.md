@@ -4,6 +4,7 @@
 - [ ] exiting failing with `pump_to_channel() = I/O error (os error 5)`
 - [ ] add clap to server/client
   - [ ] add options to specify kernel and path to block device
+  - [ ] add option to dump boot logs to the output/file
 
 # Jun 30
 
