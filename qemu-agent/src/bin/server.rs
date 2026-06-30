@@ -17,7 +17,6 @@ use std::process::ExitCode;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 use std::{env, io};
 
 fn main() -> ExitCode {
@@ -174,7 +173,7 @@ fn client_read_worker(reader: FrameReader<File>, mut master: File) {
                 // Unknown endpoints: drop (the frame is already consumed).
             }
             Err(e) => {
-                // eprintln!("channel_to_child() error {e}");
+                eprintln!("channel_to_child() error {e}");
                 break;
             }
         }

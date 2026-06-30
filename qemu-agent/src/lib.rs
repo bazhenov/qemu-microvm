@@ -20,7 +20,6 @@ use std::{
     io::{self, Read, Write},
     os::fd::AsFd,
 };
-use thiserror::Error;
 
 pub mod qemu;
 
@@ -46,15 +45,21 @@ pub enum Endpoint {
     Start = 5,
 }
 
-/// Errors produced while encoding or decoding frames.
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
-    #[error("payload too large: {len} bytes (max {MAX_PAYLOAD})")]
-    PayloadTooLarge { len: usize },
-    #[error("unexpected eof in the middle of a frame")]
-    UnexpectedEof,
+/// Error for a payload that exceeds [`MAX_PAYLOAD`], reported as
+/// [`io::ErrorKind::InvalidInput`].
+fn payload_too_large(len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("payload too large: {len} bytes (max {MAX_PAYLOAD})"),
+    )
+}
+
+/// Error for an EOF reached in the middle of a frame.
+fn unexpected_eof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "unexpected eof in the middle of a frame",
+    )
 }
 
 /// A decoded message: an endpoint id plus its raw payload.
@@ -105,11 +110,9 @@ impl Frame {
     }
 
     /// Serialize the frame to `w`.
-    pub fn write_to<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         if self.payload.len() > MAX_PAYLOAD {
-            return Err(Error::PayloadTooLarge {
-                len: self.payload.len(),
-            });
+            return Err(payload_too_large(self.payload.len()));
         }
         let len = self.payload.len() as u16;
         let mut header = [0u8; 3];
@@ -125,9 +128,9 @@ impl Frame {
 
 /// Reads frames from an underlying byte stream.
 ///
-/// Iterating yields `Result<Frame, Error>`. A clean EOF at a frame boundary
+/// Iterating yields `io::Result<Frame>`. A clean EOF at a frame boundary
 /// ends the iterator (`None`); an EOF in the middle of a frame surfaces as
-/// `Error::UnexpectedEof`.
+/// an [`io::ErrorKind::UnexpectedEof`] error.
 pub struct FrameReader<R: Read> {
     inner: R,
 }
@@ -159,33 +162,33 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 impl<R: Read> Iterator for FrameReader<R> {
-    type Item = Result<Frame, Error>;
+    type Item = io::Result<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut header = [0u8; 3];
         let n = match read_full(&mut self.inner, &mut header) {
             Ok(n) => n,
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => return Some(Err(e)),
         };
         if n == 0 {
             return None; // clean EOF at a frame boundary
         }
         if n < header.len() {
-            return Some(Err(Error::UnexpectedEof));
+            return Some(Err(unexpected_eof()));
         }
 
         let endpoint = header[0];
         let len = u16::from_le_bytes([header[1], header[2]]) as usize;
         // eprintln!("Received header:Len: {header:?}, len: {len}");
         if len > MAX_PAYLOAD {
-            return Some(Err(Error::PayloadTooLarge { len }));
+            return Some(Err(payload_too_large(len)));
         }
 
         let mut payload = vec![0u8; len];
         match read_full(&mut self.inner, &mut payload) {
             Ok(m) if m == len => Some(Ok(Frame { endpoint, payload })),
-            Ok(_) => Some(Err(Error::UnexpectedEof)),
-            Err(e) => Some(Err(e.into())),
+            Ok(_) => Some(Err(unexpected_eof())),
+            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -256,10 +259,8 @@ mod tests {
     fn oversize_payload_rejected_on_write() {
         let frame = Frame::stdout(vec![0u8; MAX_PAYLOAD + 1]);
         let mut buf = Vec::new();
-        match frame.write_to(&mut buf) {
-            Err(Error::PayloadTooLarge { len }) => assert_eq!(len, MAX_PAYLOAD + 1),
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
-        }
+        let err = frame.write_to(&mut buf).expect_err("expected an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -269,19 +270,22 @@ mod tests {
         let mut bytes = vec![Endpoint::Stdout as u8];
         bytes.extend_from_slice(&bogus_len.to_le_bytes());
         let mut reader = FrameReader::new(io::Cursor::new(bytes));
-        match reader.next() {
-            Some(Err(Error::PayloadTooLarge { len })) => assert_eq!(len, MAX_PAYLOAD + 1),
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
-        }
+        let err = reader
+            .next()
+            .expect("a result")
+            .expect_err("expected an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn truncated_header_is_unexpected_eof() {
         let reader = FrameReader::new(io::Cursor::new(vec![Endpoint::Stdin as u8]));
-        match reader.into_iter().next() {
-            Some(Err(Error::UnexpectedEof)) => {}
-            other => panic!("expected UnexpectedEof, got {other:?}"),
-        }
+        let err = reader
+            .into_iter()
+            .next()
+            .expect("a result")
+            .expect_err("expected an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -290,10 +294,11 @@ mod tests {
         let mut bytes = vec![Endpoint::Stdin as u8, 5, 0];
         bytes.extend_from_slice(b"ab");
         let mut reader = FrameReader::new(io::Cursor::new(bytes));
-        match reader.next() {
-            Some(Err(Error::UnexpectedEof)) => {}
-            other => panic!("expected UnexpectedEof, got {other:?}"),
-        }
+        let err = reader
+            .next()
+            .expect("a result")
+            .expect_err("expected an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

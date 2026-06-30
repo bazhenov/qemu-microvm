@@ -90,14 +90,13 @@ fn run(path: &str) -> io::Result<()> {
 
     // Any thread that finishes (clean disconnect, EOF, or error) signals here;
     // main then returns and drops the RawGuard, restoring the terminal.
-    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel();
 
     // Channel -> local stdout/stderr.
     {
         let done = done_tx.clone();
         thread::spawn(move || {
-            output_loop(reader);
-            let _ = done.send(());
+            let _ = done.send(output_loop(reader));
         });
     }
 
@@ -106,8 +105,7 @@ fn run(path: &str) -> io::Result<()> {
         let writer = Arc::clone(&writer);
         let done = done_tx.clone();
         thread::spawn(move || {
-            input_loop(writer);
-            let _ = done.send(());
+            let _ = done.send(input_loop(writer));
         });
     }
 
@@ -116,14 +114,12 @@ fn run(path: &str) -> io::Result<()> {
         let writer = Arc::clone(&writer);
         let done = done_tx.clone();
         thread::spawn(move || {
-            resize_loop(writer);
-            let _ = done.send(());
+            let _ = done.send(resize_loop(writer));
         });
     }
 
     // Block until something ends the session.
-    let _ = done_rx.recv();
-    Ok(())
+    done_rx.recv().expect("finish signal")
 }
 
 /// Decode frames from the channel and write payloads to the local terminal.
@@ -158,7 +154,7 @@ fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
 }
 
 /// Read raw stdin, filter the local escape sequence, forward the rest.
-fn input_loop(writer: Arc<Mutex<File>>) {
+fn input_loop(writer: Arc<Mutex<File>>) -> io::Result<()> {
     let mut stdin = io::stdin();
     let mut buf = [0u8; MAX_PAYLOAD];
     let mut escaped = false;
@@ -174,32 +170,27 @@ fn input_loop(writer: Arc<Mutex<File>>) {
                     break;
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                thread::yield_now();
                 continue;
             }
-            Err(e) => {
-                eprintln!("input_loop() = {e} ({})", e.kind());
-                break;
-            }
+            Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 /// Re-query the terminal size on every SIGWINCH and forward it.
-fn resize_loop(writer: Arc<Mutex<File>>) {
-    let mut signals = match Signals::new([SIGWINCH]) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for _ in signals.forever() {
+fn resize_loop(writer: Arc<Mutex<File>>) -> io::Result<()> {
+    for _ in Signals::new([SIGWINCH])?.forever() {
         if let Ok((cols, rows)) = crossterm::terminal::size() {
-            if send_frame(&writer, &Frame::resize(cols, rows)).is_err() {
-                break;
-            }
+            send_frame(&writer, &Frame::resize(cols, rows))?
         }
     }
+    Ok(())
 }
 
 /// Strip the `Ctrl-]` `q` escape sequence from `input`, returning the bytes to
@@ -235,9 +226,7 @@ fn send_frame(writer: &Arc<Mutex<File>>, frame: &Frame) -> io::Result<()> {
     let mut w = writer
         .lock()
         .map_err(|_| io::Error::other("channel lock poisoned"))?;
-    frame
-        .write_to(&mut *w)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    frame.write_to(&mut *w)?;
     w.flush()
 }
 
