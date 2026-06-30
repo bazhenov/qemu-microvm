@@ -6,26 +6,25 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
+use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use std::{env, io};
-
-use nix::sys::termios;
-use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
 
 fn main() -> ExitCode {
     let (client_channel, _slave) = match env::var_os("TTY_PATH") {
         Some(p) => {
             let fd = OpenOptions::new().write(true).read(true).open(p).unwrap();
-            configure_raw_pty(&fd).unwrap();
+            // configure_raw_pty(&fd).unwrap();
             (fd, None)
         }
         None => {
@@ -51,7 +50,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(client_channel: File, cmd: &[&str]) -> io::Result<()> {
+fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
+    // There is some kind of race, that I was unable to diagnose yet.
+    // If we try to write to communication_channel immediatley write will succeed,
+    // but the data will be lost. We need to wait a little bit. Probably until
+    // serial device will be connected to the host pty, idk.
+    thread::sleep(Duration::from_millis(100));
+    let start_frame = Frame::new(Endpoint::Start as u8, vec![]);
+    start_frame.write_to(&mut client_channel).unwrap();
     let channel_writer = client_channel.try_clone()?;
     let channel_fd = client_channel.as_raw_fd();
     let mut client_channel_reader = FrameReader::new(client_channel);

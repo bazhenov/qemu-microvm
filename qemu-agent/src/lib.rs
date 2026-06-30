@@ -42,6 +42,7 @@ pub enum Endpoint {
     Stderr = 2,
     /// terminal resize `cols:u16, rows:u16` (listener: server)
     Resize = 4,
+    Start = 5,
 }
 
 /// Errors produced while encoding or decoding frames.

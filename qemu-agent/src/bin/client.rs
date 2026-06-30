@@ -59,6 +59,16 @@ fn run(path: &str) -> io::Result<()> {
     let channel = File::options().read(true).write(true).open(path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
+    let mut reader = FrameReader::new(reader_file);
+    match reader.next() {
+        Some(Ok(f)) => {
+            if f.endpoint != Endpoint::Start as u8 {
+                panic!("Expected start frame. Got: {}", f.endpoint);
+            }
+        }
+        Some(Err(e)) => panic!("{e}"),
+        None => panic!("Unexpected EOF"),
+    }
     let writer = Arc::new(Mutex::new(channel));
 
     let _guard = RawGuard::enable()?;
@@ -75,7 +85,7 @@ fn run(path: &str) -> io::Result<()> {
     {
         let done = done_tx.clone();
         thread::spawn(move || {
-            output_loop(reader_file);
+            output_loop(reader);
             let _ = done.send(());
         });
     }
@@ -106,8 +116,7 @@ fn run(path: &str) -> io::Result<()> {
 }
 
 /// Decode frames from the channel and write payloads to the local terminal.
-fn output_loop(reader_file: File) {
-    let reader = FrameReader::new(reader_file);
+fn output_loop<R: Read>(reader: FrameReader<R>) {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     for item in reader {
