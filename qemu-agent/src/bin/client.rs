@@ -127,7 +127,7 @@ fn run(path: &str) -> io::Result<()> {
 }
 
 /// Decode frames from the channel and write payloads to the local terminal.
-fn output_loop<R: Read>(reader: FrameReader<R>) {
+fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     for item in reader {
@@ -154,6 +154,7 @@ fn output_loop<R: Read>(reader: FrameReader<R>) {
             }
         }
     }
+    Ok(())
 }
 
 /// Read raw stdin, filter the local escape sequence, forward the rest.

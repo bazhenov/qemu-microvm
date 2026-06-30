@@ -13,16 +13,15 @@ exec qemu-system-aarch64 \
         `#-cpu cortex-a72` \
         -nodefaults -no-user-config -nographic -no-reboot \
     `# CPU settings` \
-        -M virt -smp cpus=4,sockets=1,cores=4,threads=1 -m 512M \
+        -M virt -smp cpus=1,sockets=1,cores=1,threads=1 -m 512M \
     `# Serial port settings` \
         -device virtio-serial-device \
     `# hvc0 serial device with QEMU monitor in a multiplexed mode` \
-        -chardev stdio,signal=off,mux=on,id=console-hvc0 \
+        -chardev stdio,signal=off,id=console-hvc0 \
         -device virtconsole,chardev=console-hvc0 \
-        -mon chardev=console-hvc0,mode=readline \
     `# hvc1 serial device for a ./console pty` \
-        -chardev pty,path=./console,id=console-hvc1 \
-        -device virtconsole,chardev=console-hvc1 \
+        -chardev pty,signal=off,path=./console,id=console-hvc1 \
+        -device virtserialport,chardev=console-hvc1 \
     `# Root disk drive` \
         -drive id=root,file=rootfs-overlay.qcow2,format=qcow2,if=none \
         -device virtio-blk-device,drive=root \
@@ -40,4 +39,4 @@ exec qemu-system-aarch64 \
     `# Linux kernel settings` \
         -kernel ./Image \
         -initrd initrd.gz \
-        -append "console=hvc0 console=hvc1 reboot=t rdinit=/init panic=-1"
+        -append "console=hvc0 reboot=t rdinit=/init panic=-1"

@@ -55,7 +55,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     // If we try to write to communication_channel immediatley write will succeed,
     // but the data will be lost. We need to wait a little bit. Probably until
     // serial device will be connected to the host pty, idk.
-    thread::sleep(Duration::from_millis(100));
+    // thread::sleep(Duration::from_millis(100));
     let start_frame = Frame::new(Endpoint::Start as u8, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
     let channel_writer = client_channel.try_clone()?;
@@ -79,7 +79,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     // stdin bytes that arrive before the first resize are buffered and
     // flushed once the shell is running.
     let mut pending = Vec::new();
-    eprintln!("Waiting for size...");
+    // eprintln!("Waiting for size...");
     let (cols, rows) = loop {
         match client_channel_reader.next() {
             Some(Ok(frame)) => {
@@ -98,7 +98,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
             }
         }
     };
-    eprintln!("Size received {cols}x{rows}...");
+    // eprintln!("Size received {cols}x{rows}...");
     set_winsize(master_fd, cols, rows);
 
     // Build exec arguments and environment before forking so the child does
@@ -110,7 +110,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         .map(CString::new)
         .collect::<Result<Vec<_>, _>>()?;
     let envp = build_env();
-    eprintln!("Spawning: {:?}", argv);
+    // eprintln!("Spawning: {:?}", argv);
 
     let child = unsafe { libc::fork() };
     if child < 0 {
