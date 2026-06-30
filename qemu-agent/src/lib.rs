@@ -28,21 +28,38 @@ pub const MAX_FRAME_SIZE: usize = 16384;
 /// Maximum payload length: a frame minus its 3-byte header.
 pub const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 3; // 16381
 
-/// Logical channels carried over the single byte stream.
-///
-/// The numeric values are the on-wire endpoint IDs. Endpoint 3 is reserved.
+/// Logical frame types carried over the single byte stream.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Endpoint {
+pub enum FrameType {
+    Unknown,
+    Start = 1,
     /// stdin bytes for the shell (listener: server)
-    Stdin = 0,
+    Stdin = 2,
     /// stdout bytes from the shell (listener: client)
-    Stdout = 1,
+    Stdout = 3,
     /// stderr bytes from the shell (listener: client)
-    Stderr = 2,
+    Stderr = 4,
     /// terminal resize `cols:u16, rows:u16` (listener: server)
-    Resize = 4,
-    Start = 5,
+    Resize = 5,
+}
+
+impl From<u8> for FrameType {
+    fn from(value: u8) -> Self {
+        if value == FrameType::Stdin as u8 {
+            FrameType::Stdin
+        } else if value == FrameType::Start as u8 {
+            FrameType::Start
+        } else if value == FrameType::Stdout as u8 {
+            FrameType::Stdout
+        } else if value == FrameType::Stderr as u8 {
+            FrameType::Stderr
+        } else if value == FrameType::Resize as u8 {
+            FrameType::Resize
+        } else {
+            FrameType::Unknown
+        }
+    }
 }
 
 /// Error for a payload that exceeds [`MAX_PAYLOAD`], reported as
@@ -65,29 +82,32 @@ fn unexpected_eof() -> io::Error {
 /// A decoded message: an endpoint id plus its raw payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    pub endpoint: u8,
+    pub frame_type: FrameType,
     pub payload: Vec<u8>,
 }
 
 impl Frame {
     /// Build a frame for an arbitrary endpoint id and payload.
-    pub fn new(endpoint: u8, payload: Vec<u8>) -> Self {
-        Self { endpoint, payload }
+    pub fn new(frame_type: FrameType, payload: Vec<u8>) -> Self {
+        Self {
+            frame_type,
+            payload,
+        }
     }
 
     /// stdin bytes for the shell.
     pub fn stdin(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::new(Endpoint::Stdin as u8, bytes.into())
+        Self::new(FrameType::Stdin, bytes.into())
     }
 
     /// stdout bytes from the shell.
     pub fn stdout(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::new(Endpoint::Stdout as u8, bytes.into())
+        Self::new(FrameType::Stdout, bytes.into())
     }
 
     /// stderr bytes from the shell.
     pub fn stderr(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::new(Endpoint::Stderr as u8, bytes.into())
+        Self::new(FrameType::Stderr, bytes.into())
     }
 
     /// A terminal resize event.
@@ -95,12 +115,12 @@ impl Frame {
         let mut payload = Vec::with_capacity(4);
         payload.extend_from_slice(&cols.to_le_bytes());
         payload.extend_from_slice(&rows.to_le_bytes());
-        Self::new(Endpoint::Resize as u8, payload)
+        Self::new(FrameType::Resize, payload)
     }
 
     /// Decode a resize payload, if this frame is a well-formed resize.
     pub fn as_resize(&self) -> Option<(u16, u16)> {
-        if self.endpoint == Endpoint::Resize as u8 && self.payload.len() == 4 {
+        if self.frame_type == FrameType::Resize && self.payload.len() == 4 {
             let cols = u16::from_le_bytes([self.payload[0], self.payload[1]]);
             let rows = u16::from_le_bytes([self.payload[2], self.payload[3]]);
             Some((cols, rows))
@@ -116,7 +136,7 @@ impl Frame {
         }
         let len = self.payload.len() as u16;
         let mut header = [0u8; 3];
-        header[0] = self.endpoint;
+        header[0] = self.frame_type as u8;
         header[1..3].copy_from_slice(&len.to_le_bytes());
         // eprintln!("Sending header: {header:?}");
         w.write_all(&header)?;
@@ -177,7 +197,6 @@ impl<R: Read> Iterator for FrameReader<R> {
             return Some(Err(unexpected_eof()));
         }
 
-        let endpoint = header[0];
         let len = u16::from_le_bytes([header[1], header[2]]) as usize;
         // eprintln!("Received header:Len: {header:?}, len: {len}");
         if len > MAX_PAYLOAD {
@@ -186,7 +205,10 @@ impl<R: Read> Iterator for FrameReader<R> {
 
         let mut payload = vec![0u8; len];
         match read_full(&mut self.inner, &mut payload) {
-            Ok(m) if m == len => Some(Ok(Frame { endpoint, payload })),
+            Ok(m) if m == len => Some(Ok(Frame {
+                frame_type: FrameType::from(header[0]),
+                payload,
+            })),
             Ok(_) => Some(Err(unexpected_eof())),
             Err(e) => Some(Err(e)),
         }
@@ -267,7 +289,7 @@ mod tests {
     fn oversize_payload_rejected_on_read() {
         // Hand-craft a header advertising a payload bigger than the ceiling.
         let bogus_len = (MAX_PAYLOAD + 1) as u16;
-        let mut bytes = vec![Endpoint::Stdout as u8];
+        let mut bytes = vec![FrameType::Stdout as u8];
         bytes.extend_from_slice(&bogus_len.to_le_bytes());
         let mut reader = FrameReader::new(io::Cursor::new(bytes));
         let err = reader
@@ -279,7 +301,7 @@ mod tests {
 
     #[test]
     fn truncated_header_is_unexpected_eof() {
-        let reader = FrameReader::new(io::Cursor::new(vec![Endpoint::Stdin as u8]));
+        let reader = FrameReader::new(io::Cursor::new(vec![FrameType::Stdin as u8]));
         let err = reader
             .into_iter()
             .next()
@@ -291,7 +313,7 @@ mod tests {
     #[test]
     fn truncated_payload_is_unexpected_eof() {
         // Header claims 5 bytes of payload, but only 2 follow.
-        let mut bytes = vec![Endpoint::Stdin as u8, 5, 0];
+        let mut bytes = vec![FrameType::Stdin as u8, 5, 0];
         bytes.extend_from_slice(b"ab");
         let mut reader = FrameReader::new(io::Cursor::new(bytes));
         let err = reader
@@ -305,9 +327,9 @@ mod tests {
     fn unknown_endpoint_still_decodes() {
         // Endpoint 99 is unknown, but the frame must still decode so the
         // stream stays in sync; the caller decides to drop it.
-        let frame = Frame::new(99, b"mystery".to_vec());
+        let frame = Frame::new(FrameType::Unknown, b"mystery".to_vec());
         let decoded = round_trip(&frame);
-        assert_eq!(decoded.endpoint, 99);
+        assert_eq!(decoded.frame_type, FrameType::Unknown);
         assert_eq!(decoded.payload, b"mystery");
         assert!(decoded.as_resize().is_none());
     }

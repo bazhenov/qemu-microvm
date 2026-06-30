@@ -6,8 +6,9 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
-use qemu_agent::{configure_raw_pty, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
+use qemu_agent::{configure_raw_pty, Frame, FrameReader, FrameType, MAX_PAYLOAD};
 use std::ffi::{CStr, CString, OsStr};
+use std::fmt::format;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -15,7 +16,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::{env, io};
 
@@ -55,7 +56,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     // but the data will be lost. We need to wait a little bit. Probably until
     // serial device will be connected to the host pty, idk.
     // thread::sleep(Duration::from_millis(100));
-    let start_frame = Frame::new(Endpoint::Start as u8, vec![]);
+    let start_frame = Frame::new(FrameType::Start, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
     let channel_writer = client_channel.try_clone()?;
     let channel_fd = client_channel.as_raw_fd();
@@ -74,30 +75,12 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     let master_fd = master.as_raw_fd();
     let slave_fd = slave.as_raw_fd();
 
-    // The server blocks until the client announces its terminal size. Any
-    // stdin bytes that arrive before the first resize are buffered and
-    // flushed once the shell is running.
-    let mut pending = Vec::new();
-    // eprintln!("Waiting for size...");
-    let (cols, rows) = loop {
-        match client_channel_reader.next() {
-            Some(Ok(frame)) => {
-                if let Some(size) = frame.as_resize() {
-                    break size;
-                } else if frame.endpoint == Endpoint::Stdin as u8 {
-                    pending.extend_from_slice(&frame.payload);
-                } else {
-                    panic!("Unexpected frame: {}", frame.endpoint);
-                }
-                // Other endpoints before the shell exists: drop.
-            }
-            Some(Err(e)) => return Err(io::Error::other(format!("decode: {e}"))),
-            None => {
-                return Err(io::Error::other("channel closed before initial resize"));
-            }
-        }
+    let first_frame = client_channel_reader
+        .next()
+        .expect("channel closed before initial resize")?;
+    let Some((cols, rows)) = first_frame.as_resize() else {
+        panic!("Unexpected frame: {:?}", first_frame.frame_type);
     };
-    // eprintln!("Size received {cols}x{rows}...");
     set_winsize(master_fd, cols, rows);
 
     // Build exec arguments and environment before forking so the child does
@@ -125,85 +108,78 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         // Hand the slave end and the pipe's write end to the child only.
         drop(slave);
 
-        let mut master_writer = File::from(master);
-        if !pending.is_empty() {
-            master_writer.write_all(&pending)?;
-            master_writer.flush()?;
-        }
+        let master_writer = File::from(master);
         let master_reader = master_writer.try_clone()?;
 
-        let sink = Arc::new(Mutex::new(channel_writer));
+        let sink = channel_writer;
 
-        // eprintln!("Spawning tasks...");
+        let (done_tx, done_rx) = mpsc::channel();
+
         // Channel -> child: decode frames, drive the PTY.
-        let t_in = thread::spawn(move || client_read_worker(client_channel_reader, master_writer));
+        let stdin_handle = {
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                let _ = done_tx.send(pump_stdin(client_channel_reader, master_writer));
+            })
+        };
 
         // PTY master -> channel as stdout frames.
-        let t_out = {
-            let sink = Arc::clone(&sink);
-            thread::spawn(move || pump_to_channel(master_reader, Endpoint::Stdout as u8, sink))
+        let stdout_handle = {
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                let _ = done_tx.send(pump_stdout(master_reader, sink));
+            })
         };
+
+        // done_tx dhould be dropped here, otherwise loop will never finish
+        // drop(done_tx);
+        // while let Ok(r) = done_rx.recv() {
+        //     r?;
+        // }
 
         // Reap the shell. When it dies the PTY master and stderr pipe hit EOF and
         // the output threads finish; the input thread may still be blocked on the
         // channel, so we exit the process rather than joining it.
         // eprintln!("Waiting for exit");
         let _ = wait_for(child);
-        let _ = t_out.join();
-        drop(t_in);
+        let _ = stdout_handle.join();
+        drop(stdin_handle);
         Ok(())
     }
 }
 
 /// Decode frames from the channel and apply them to the PTY master.
-fn client_read_worker(reader: FrameReader<File>, mut master: File) {
+fn pump_stdin(reader: FrameReader<File>, mut master: File) -> io::Result<()> {
     for item in reader {
-        match item {
-            Ok(frame) => {
-                // eprintln!("Processing frame!");
-                if frame.endpoint == Endpoint::Stdin as u8 {
-                    if master.write_all(&frame.payload).is_err() || master.flush().is_err() {
-                        break;
-                    }
-                } else if let Some((cols, rows)) = frame.as_resize() {
-                    set_winsize(master.as_raw_fd(), cols, rows);
-                } else {
-                    // eprintln!("channel_to_child() unknown frame {}", frame.endpoint);
-                }
-                // Unknown endpoints: drop (the frame is already consumed).
-            }
-            Err(e) => {
-                eprintln!("channel_to_child() error {e}");
-                break;
-            }
+        let frame = item?;
+        if frame.frame_type == FrameType::Stdin {
+            master.write_all(&frame.payload)?;
+            master.flush()?;
+        } else if let Some((cols, rows)) = frame.as_resize() {
+            set_winsize(master.as_raw_fd(), cols, rows);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unexpected frame type: {:?}", frame.frame_type),
+            ));
         }
     }
-    // eprintln!("channel_to_child() finished")
+    Ok(())
 }
 
 /// Read bytes from `src`, chunk them into frames on `endpoint`, and write each
 /// whole frame to the shared channel under the lock so frames never interleave.
-fn pump_to_channel(mut src: File, endpoint: u8, sink: Arc<Mutex<File>>) {
+fn pump_stdout(mut src: File, mut sink: File) -> io::Result<()> {
     let mut buf = [0u8; MAX_PAYLOAD];
-    loop {
-        match src.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let frame = Frame::new(endpoint, buf[..n].to_vec());
-                let mut w = match sink.lock() {
-                    Ok(w) => w,
-                    Err(_) => break,
-                };
-                frame.write_to(&mut *w).unwrap();
-            }
-            // Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                eprintln!("pump_to_channel() = {e}");
-                break;
-            }
-        }
+
+    let mut bytes_read = src.read(&mut buf)?;
+    while bytes_read > 0 {
+        let frame = Frame::new(FrameType::Stdout, buf[..bytes_read].to_vec());
+        frame.write_to(&mut sink)?;
+        bytes_read = src.read(&mut buf)?;
     }
-    // eprintln!("pump_to_channel() finished")
+
+    Ok(())
 }
 
 /// Child half of fork/exec. Replaces the process image; never returns.

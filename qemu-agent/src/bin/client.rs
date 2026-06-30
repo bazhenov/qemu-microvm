@@ -7,7 +7,7 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 //! `Ctrl-]` then `q` disconnects locally.
 
-use qemu_agent::{configure_raw_pty, qemu, Endpoint, Frame, FrameReader, MAX_PAYLOAD};
+use qemu_agent::{configure_raw_pty, qemu, Frame, FrameReader, FrameType, MAX_PAYLOAD};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use std::fs::{self, File};
@@ -73,8 +73,8 @@ fn run(path: &str) -> io::Result<()> {
     let mut reader = FrameReader::new(reader_file);
     match reader.next() {
         Some(Ok(f)) => {
-            if f.endpoint != Endpoint::Start as u8 {
-                panic!("Expected start frame. Got: {}", f.endpoint);
+            if f.frame_type != FrameType::Start {
+                panic!("Expected start frame. Got: {:?}", f.frame_type);
             }
         }
         Some(Err(e)) => panic!("{e}"),
@@ -129,18 +129,18 @@ fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
     for item in reader {
         // eprintln!("Output loop fired");
         match item {
-            Ok(frame) if frame.endpoint == Endpoint::Stdout as u8 => {
+            Ok(frame) if frame.frame_type == FrameType::Stdout => {
                 if stdout.write_all(&frame.payload).is_err() || stdout.flush().is_err() {
                     break;
                 }
             }
-            Ok(frame) if frame.endpoint == Endpoint::Stderr as u8 => {
+            Ok(frame) if frame.frame_type == FrameType::Stderr => {
                 if stderr.write_all(&frame.payload).is_err() || stderr.flush().is_err() {
                     break;
                 }
             }
             Ok(frame) => {
-                eprintln!("Unknown frame endpoint = {}", frame.endpoint);
+                eprintln!("Unknown frame endpoint = {:?}", frame.frame_type);
                 break;
             }
 
