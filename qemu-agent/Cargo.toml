@@ -19,6 +19,7 @@ path = "src/bin/client.rs"
 thiserror = "2"
 crossterm = "0.28"
 rand = "0.10.1"
+tempdir = "0.3.7"
 nix = { version = "0.31.3", features = ["term"] }
 clap = { version = "4.6.1", features = ["derive"] }
 
@@ -28,4 +29,3 @@ signal-hook = "0.3"
 
 [dev-dependencies]
 regex = "1.12.4"
-tempdir = "0.3.7"

@@ -14,7 +14,6 @@ use qemu_agent::{
 };
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
-    env,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -23,6 +22,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tempdir::TempDir;
 
 /// `Ctrl-]` — begins the local escape sequence.
 const ESCAPE: u8 = 0x1d;
@@ -44,14 +44,23 @@ fn main() -> ExitCode {
     let (path, join_handle) = if let Some(path) = args.serial {
         (path, None)
     } else {
+        let tmp = TempDir::new("vm").unwrap();
+        let serial_path = tmp.path().join("vm-server");
         let opts = VmLaunchOpts {
             dump_boot_log: args.dump_boot_log,
+            serial_path: serial_path.clone(),
         };
-        let handle = thread::spawn(move || qemu::launch_vm(opts));
-        while !fs::exists(qemu::CONSOLE).unwrap() {
+        let handle = thread::spawn(move || {
+            let result = qemu::launch_vm(opts);
+            // We want to drop tmpdir only after VM has finished
+            drop(tmp);
+            result
+        });
+        // Waiting util VM has started
+        while !fs::exists(&serial_path).unwrap() {
             thread::sleep(Duration::from_millis(50));
         }
-        (PathBuf::from(qemu::CONSOLE), Some(handle))
+        (serial_path, Some(handle))
     };
 
     let result = run(&path);

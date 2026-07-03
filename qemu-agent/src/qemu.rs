@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
@@ -16,6 +17,10 @@ pub struct VmLaunchOpts {
     ///
     /// This only should be used for diagnostic, because it might break terminal working in VM
     pub dump_boot_log: bool,
+
+    /// Path to a tty that will be linked to a serial device in a VM which is used for
+    /// communicating with VM-server
+    pub serial_path: PathBuf,
 }
 
 /// Launch the microVM under QEMU
@@ -28,12 +33,6 @@ pub struct VmLaunchOpts {
 ///
 /// Paths are relative to the current working directory.
 pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
-    match fs::remove_file(CONSOLE) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
     // create the overlay disk the first time, backed by rootfs.qcow2.
     if !Path::new(OVERLAY).exists() {
         let status = Command::new("qemu-img")
@@ -90,7 +89,10 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
             "virtconsole,chardev=console-hvc0",
             // Data port exposed to the host as the pty.
             "-chardev",
-            &format!("pty,signal=off,path={},id=console-hvc1", CONSOLE),
+            &format!(
+                "pty,signal=off,path={},id=console-hvc1",
+                opts.serial_path.display()
+            ),
             "-device",
             "virtserialport,chardev=console-hvc1",
             // Root disk drive.
