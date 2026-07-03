@@ -36,8 +36,6 @@ else
     mount -t devtmpfs devtmpfs /mnt/dev
     mount -t devpts devpts /mnt/dev/pts
 
-    cp /bin/server /mnt/bin/server
-
     # From now on we do not care about exit code. We steel need to move on
     set +e
     /usr/bin/env -i TERM=xterm-color TTY_PATH=/dev/vport2p1 /bin/server /usr/sbin/chroot /mnt /usr/bin/bash --login +h
