@@ -28,13 +28,19 @@ fn run_tty_test(args: &[impl AsRef<OsStr>]) -> Output {
         .map(|s| s.as_ref().to_os_string())
         .collect::<Vec<_>>();
 
-    let server_out = thread::spawn(|| command(SERVER).args(args).current_dir(path).output());
+    let server_out = thread::spawn(|| {
+        command(SERVER)
+            .arg("--")
+            .args(args)
+            .current_dir(path)
+            .output()
+    });
 
     // Waiting until server creates an tty
     wait_for_path(tmp_dir.path().join("tty"));
 
     let mut child = command(CLIENT)
-        .args(["tty"])
+        .args(["./tty"])
         .current_dir(tmp_dir.path())
         .spawn()
         .unwrap();

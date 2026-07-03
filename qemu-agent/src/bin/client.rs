@@ -7,32 +7,41 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 //! `Ctrl-]` then `q` disconnects locally.
 
-use qemu_agent::{configure_raw_pty, qemu, Frame, FrameReader, FrameType, MAX_PAYLOAD};
-use signal_hook::consts::SIGWINCH;
-use signal_hook::iterator::Signals;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::process::ExitCode;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::{env, thread};
+use clap::Parser;
+use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty, qemu};
+use signal_hook::{consts::SIGWINCH, iterator::Signals};
+use std::{
+    env,
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
 
 /// `Ctrl-]` — begins the local escape sequence.
 const ESCAPE: u8 = 0x1d;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// If specified no VM will be launched automatically. Instead client will connect to a given pty
+    #[arg(long = "serial", name = "path")]
+    serial: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
-    let (path, join_handle) = if env::var("LAUNCH_QEMU").is_ok() {
+    let args = Args::parse();
+    let (path, join_handle) = if let Some(path) = args.serial {
+        (path, None)
+    } else {
         let handle = thread::spawn(qemu::launch_vm);
         while !fs::exists(qemu::CONSOLE).unwrap() {
             thread::sleep(Duration::from_millis(50));
         }
-        (qemu::CONSOLE.to_string(), Some(handle))
-    } else if let Some(p) = std::env::args().nth(1) {
-        (p, None)
-    } else {
-        eprintln!("usage: client <channel-device>");
-        return ExitCode::from(2);
+        (PathBuf::from(qemu::CONSOLE), Some(handle))
     };
 
     let result = run(&path);
@@ -65,7 +74,7 @@ impl Drop for RawGuard {
     }
 }
 
-fn run(path: &str) -> io::Result<()> {
+fn run(path: &Path) -> io::Result<()> {
     let channel = File::options().read(true).write(true).open(path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;

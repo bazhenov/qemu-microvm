@@ -38,7 +38,7 @@ else
 
     # From now on we do not care about exit code. We steel need to move on
     set +e
-    /usr/bin/env -i TERM=xterm-color TTY_PATH=/dev/vport2p1 /bin/server /usr/sbin/chroot /mnt /usr/bin/bash --login +h
+    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport2p1 -- /usr/sbin/chroot /mnt /usr/bin/bash --login +h
     set -e
 
     # Moving system mounts back

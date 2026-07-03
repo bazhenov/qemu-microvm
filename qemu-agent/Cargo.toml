@@ -20,6 +20,7 @@ thiserror = "2"
 crossterm = "0.28"
 rand = "0.10.1"
 nix = { version = "0.31.3", features = ["term"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

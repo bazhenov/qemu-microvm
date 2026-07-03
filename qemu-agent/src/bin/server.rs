@@ -6,18 +6,19 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
+use clap::Parser;
 use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
 use std::{
     env,
     ffi::{CStr, CString},
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     iter::once,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
+            self,
             ffi::{OsStrExt, OsStringExt},
-            fs,
         },
     },
     path::PathBuf,
@@ -27,11 +28,23 @@ use std::{
     thread,
 };
 
+const TTY_PATH: &str = "./tty";
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    /// path to the serial device for communicating with the host
+    pub serial: Option<PathBuf>,
+    pub command: Vec<String>,
+}
+
 fn main() -> ExitCode {
-    let (client_channel, _slave) = match env::var_os("TTY_PATH") {
+    let args = Args::parse();
+
+    let (client_channel, _slave) = match args.serial.as_ref() {
         Some(p) => {
             let fd = OpenOptions::new().write(true).read(true).open(p).unwrap();
-            // configure_raw_pty(&fd).unwrap();
             (fd, None)
         }
         None => {
@@ -40,21 +53,24 @@ fn main() -> ExitCode {
             // _slave needs to be bounded, otherwise pty will be closed
             let (client_channel, slave, name) = open_pty().unwrap();
             configure_raw_pty(&client_channel).unwrap();
-            fs::symlink(name, "./tty").unwrap();
+            unix::fs::symlink(name, TTY_PATH).unwrap();
             (File::from(client_channel), Some(slave))
         }
     };
 
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let cmd = args.command.iter().map(String::as_str).collect::<Vec<_>>();
 
-    match run(client_channel, &args) {
+    let exit_code = match run(client_channel, &cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("server: {e}");
             ExitCode::FAILURE
         }
+    };
+    if args.serial.is_none() && fs::exists(TTY_PATH).unwrap_or(false) {
+        let _ = fs::remove_file(TTY_PATH);
     }
+    exit_code
 }
 
 fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
@@ -67,13 +83,6 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     let mut client_channel_reader = FrameReader::new(client_channel);
 
     let (master, slave, _) = open_pty()?;
-
-    //if let Ok(current_tty) = File::open("/dev/tty") {
-    //    // If there is current terminal, copying setattr from it
-    //    let tio = termios::tcgetattr(&current_tty)?;
-    //    eprintln!("Settings termio flags: {tio:?}");
-    //    termios::tcsetattr(&master, termios::SetArg::TCSANOW, &tio)?;
-    //}
 
     // Raw fds the child must close so it doesn't inherit the channel/master.
     let master_fd = master.as_raw_fd();
