@@ -5,7 +5,7 @@ use std::{
 };
 
 /// Copy-on-write overlay over the read-only base image.
-const OVERLAY: &str = "../rootfs-overlay.qcow2";
+const OVERLAY: &str = "rootfs-overlay.qcow2";
 
 pub struct VmLaunchOpts {
     /// If true stdout/stderr of VM process will be linked to current
@@ -67,7 +67,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // CPU settings
         .args(["-M", "virt", "-smp", "cpus=1,sockets=1,cores=1,threads=1"])
         // Memory settings
-        .args(["-m", "512M"])
+        .args(["-m", "1G"])
         // virtio-serial bus carrying the two ports below
         .args(["-device", "virtio-serial-device"])
         // hvc0: console multiplexed onto stdio.
