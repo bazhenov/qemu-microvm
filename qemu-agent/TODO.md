@@ -3,6 +3,8 @@
 - [ ] add logging
 - [ ] exiting failing with `pump_to_channel() = I/O error (os error 5)`
 - [ ] add options to specify kernel and path to block device
+- [ ] isolate tmpdir with console tty when running VM
+- [ ] add end to end test with QEMU
 
 # Jul 3
 
