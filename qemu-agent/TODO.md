@@ -6,8 +6,11 @@
   - [ ] add options to specify kernel and path to block device
   - [ ] add option to dump boot logs to the output/file
 
+# Jul 3
+
+- add error reporting to all threads in server.rs
+
 # Jun 30
 
-- [x] top is failing when spamming <SPACE>
-  - [x] add error reporting to all threads in client.rs
-  - [ ] add error reporting to all threads in server.rs
+- top is failing when spamming <SPACE>
+  - add error reporting to all threads in client.rs
