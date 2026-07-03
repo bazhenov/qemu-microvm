@@ -1,15 +1,11 @@
-use std::env;
-use std::fs;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::Command;
-use std::process::Stdio;
+use std::{
+    env, io,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 /// Copy-on-write overlay over the read-only base image.
 const OVERLAY: &str = "../rootfs-overlay.qcow2";
-/// Symlink QEMU (re)creates pointing at the allocated pty for the data port.
-pub const CONSOLE: &str = "../console";
 
 pub struct VmLaunchOpts {
     /// If true stdout/stderr of VM process will be linked to current
