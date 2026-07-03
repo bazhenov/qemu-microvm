@@ -21,9 +21,8 @@ ip route add default via 10.0.2.2
 ip link set lo up
 hostname sandbox
 
-
 if grep -qw "init_recovery" /proc/cmdline; then
-    /usr/bin/env -i TERM=xterm-color TTY_PATH=/dev/vport2p1 /bin/server /bin/sh
+    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport2p1 /bin/sh
 else
     mkdir -p /mnt
     mount /dev/vda /mnt

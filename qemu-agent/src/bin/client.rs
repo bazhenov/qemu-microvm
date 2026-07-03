@@ -37,6 +37,10 @@ struct Args {
     /// Dump VM boot logs to the stdout
     #[arg(long = "boot-log")]
     dump_boot_log: bool,
+
+    /// Run VM init in a recovery mode
+    #[arg(long = "recovery")]
+    recovery: bool,
 }
 
 fn main() -> ExitCode {
@@ -44,16 +48,18 @@ fn main() -> ExitCode {
     let (path, join_handle) = if let Some(path) = args.serial {
         (path, None)
     } else {
-        let tmp = TempDir::new("vm").unwrap();
-        let serial_path = tmp.path().join("vm-server");
+        // Private temporary VM directory to hold intermediate VM artifacts
+        let private_dir = TempDir::new("vm").unwrap();
+        let serial_path = private_dir.path().join("vm-server");
         let opts = VmLaunchOpts {
             dump_boot_log: args.dump_boot_log,
             serial_path: serial_path.clone(),
+            recovery: args.recovery,
         };
         let handle = thread::spawn(move || {
             let result = qemu::launch_vm(opts);
-            // We want to drop tmpdir only after VM has finished
-            drop(tmp);
+            // We want to drop private dir only after VM has finished
+            drop(private_dir);
             result
         });
         // Waiting util VM has started

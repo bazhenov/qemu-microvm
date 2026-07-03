@@ -17,6 +17,9 @@ pub struct VmLaunchOpts {
     /// Path to a tty that will be linked to a serial device in a VM which is used for
     /// communicating with VM-server
     pub serial_path: PathBuf,
+
+    /// Start init in recovery mode
+    pub recovery: bool,
 }
 
 /// Launch the microVM under QEMU
@@ -57,33 +60,25 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
 
     let mut qemu_cmd = Command::new("qemu-system-aarch64");
     qemu_cmd
+        // General settings. Using Hypervisor.framework.
+        .args(["-accel", "hvf", "-cpu", "host"])
+        // General settings. Emulation.
+        .args(["-nodefaults", "-no-user-config", "-nographic", "-no-reboot"])
+        // CPU settings
+        .args(["-M", "virt", "-smp", "cpus=1,sockets=1,cores=1,threads=1"])
+        // Memory settings
+        .args(["-m", "512M"])
+        // virtio-serial bus carrying the two ports below
+        .args(["-device", "virtio-serial-device"])
+        // hvc0: console multiplexed onto stdio.
         .args([
-            // General settings. Using Hypervisor.framework.
-            "-accel",
-            "hvf",
-            "-cpu",
-            "host",
-            // General settings. Emulation.
-            "-nodefaults",
-            "-no-user-config",
-            "-nographic",
-            "-no-reboot",
-            // CPU settings.
-            "-M",
-            "virt",
-            "-smp",
-            "cpus=1,sockets=1,cores=1,threads=1",
-            "-m",
-            "512M",
-            // virtio-serial bus carrying the two ports below.
-            "-device",
-            "virtio-serial-device",
-            // hvc0: console multiplexed onto stdio.
             "-chardev",
             "stdio,signal=off,id=console-hvc0",
             "-device",
             "virtconsole,chardev=console-hvc0",
-            // Data port exposed to the host as the pty.
+        ])
+        // Data port exposed to the host as the pty.
+        .args([
             "-chardev",
             &format!(
                 "pty,signal=off,path={},id=console-hvc1",
@@ -91,33 +86,38 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
             ),
             "-device",
             "virtserialport,chardev=console-hvc1",
-            // Root disk drive.
+        ])
+        // Root disk drive.
+        .args([
             "-drive",
             &format!("id=root,file={},format=qcow2,if=none", OVERLAY),
             "-device",
             "virtio-blk-device,drive=root",
-            // Network (user-mode networking).
+        ])
+        // Network (user-mode networking).
+        .args([
             "-device",
             "virtio-net-device,netdev=net1",
             "-netdev",
             "user,id=net1",
-            // Realtime clock. PL031 linux driver is required.
-            "-rtc",
-            "base=utc,clock=host",
-            // RNG support.
-            "-device",
-            "virtio-rng-pci",
         ])
-        // VirtIO FS share — path is computed at runtime, so pass it separately.
+        // Realtime clock. PL031 linux driver is required.
+        .args(["-rtc", "base=utc,clock=host"])
+        // RNG support
+        .args(["-device", "virtio-rng-pci"])
+        // VirtIO FS share — path is computed at runtime, so pass it separately
         .args(["-virtfs", &virtfs])
+        // Linux kernel settings
         .args([
-            // Linux kernel settings.
             "-kernel",
             "../Image",
             "-initrd",
             "../initrd.gz",
             "-append",
-            "console=hvc0 reboot=t rdinit=/init panic=-1",
+            &format!(
+                "console=hvc0 reboot=t rdinit=/init panic=-1 {}",
+                if opts.recovery { "init_recovery" } else { "" }
+            ),
         ])
         .stdin(Stdio::piped());
 
