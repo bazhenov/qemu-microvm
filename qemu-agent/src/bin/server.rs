@@ -6,19 +6,25 @@
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
-use qemu_agent::{configure_raw_pty, Frame, FrameReader, FrameType, MAX_PAYLOAD};
-use std::ffi::{CStr, CString, OsStr};
-use std::fmt::format;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
-use std::process::ExitCode;
-use std::ptr;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::{env, io};
+use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
+use std::{
+    env,
+    ffi::{CStr, CString},
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs,
+        },
+    },
+    path::PathBuf,
+    process::ExitCode,
+    ptr,
+    sync::mpsc,
+    thread,
+};
 
 fn main() -> ExitCode {
     let (client_channel, _slave) = match env::var_os("TTY_PATH") {
@@ -33,7 +39,7 @@ fn main() -> ExitCode {
             // _slave needs to be bounded, otherwise pty will be closed
             let (client_channel, slave, name) = open_pty().unwrap();
             configure_raw_pty(&client_channel).unwrap();
-            std::os::unix::fs::symlink(name, "./tty").unwrap();
+            fs::symlink(name, "./tty").unwrap();
             (File::from(client_channel), Some(slave))
         }
     };
@@ -51,11 +57,9 @@ fn main() -> ExitCode {
 }
 
 fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
-    // There is some kind of race, that I was unable to diagnose yet.
-    // If we try to write to communication_channel immediatley write will succeed,
-    // but the data will be lost. We need to wait a little bit. Probably until
-    // serial device will be connected to the host pty, idk.
-    // thread::sleep(Duration::from_millis(100));
+    // Writing a start frame to a client allows us to bluck until the client
+    // arrives. Otherwise any attempt to read from a serial device that has no connected
+    // clients will fail with an error and we would need to spin.
     let start_frame = Frame::new(FrameType::Start, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
     let channel_writer = client_channel.try_clone()?;
@@ -119,9 +123,9 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         let stdin_handle = {
             let done_tx = done_tx.clone();
             thread::Builder::new()
-                .name("pump_stdin".into())
+                .name("pump_client_frames".into())
                 .spawn(move || {
-                    let _ = done_tx.send(pump_stdin(client_channel_reader, master_writer));
+                    let _ = done_tx.send(pump_client_frames(client_channel_reader, master_writer));
                 })
                 .expect("Unable to spawn thread")
         };
@@ -140,27 +144,40 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         drop(stdin_handle);
         // done_tx dhould be dropped here, otherwise loop will never finish
         drop(done_tx);
-        done_rx.recv().expect("No messages")?;
+
+        // Only waiting while child process is alive. try_wait_for() is workaround for a following problem:
+        //
+        // In ideal world we would wait for both children threads to finish and then reaping child process.
+        // Unfortunatley this is not possible because we need to signal client that child process has exited.
+        //
+        // The proper way to solve it is to pass stdout/stderr close() signals via communication protocol
+        // (eg. [`Frame`]), so that client can understand stat stdout has been closed, therefore communication
+        // channel as a whole needs to be closed.
+        while try_wait_for(child).is_none()
+            && let Ok(r) = done_rx.recv()
+        {
+            r.expect("Thread failed");
+        }
 
         // Reap the shell. When it dies the PTY master and stderr pipe hit EOF and
         // the output threads finish; the input thread may still be blocked on the
         // channel, so we exit the process rather than joining it.
-        // eprintln!("Waiting for exit");
         let _ = wait_for(child);
+
         let _ = stdout_handle.join();
         Ok(())
     }
 }
 
 /// Decode frames from the channel and apply them to the PTY master.
-fn pump_stdin(reader: FrameReader<File>, mut master: File) -> io::Result<()> {
+fn pump_client_frames(reader: FrameReader<impl Read>, mut tty_master: File) -> io::Result<()> {
     for item in reader {
         let frame = item?;
         if frame.frame_type == FrameType::Stdin {
-            master.write_all(&frame.payload)?;
-            master.flush()?;
+            tty_master.write_all(&frame.payload)?;
+            tty_master.flush()?;
         } else if let Some((cols, rows)) = frame.as_resize() {
-            set_winsize(master.as_raw_fd(), cols, rows);
+            set_winsize(tty_master.as_raw_fd(), cols, rows);
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -173,7 +190,7 @@ fn pump_stdin(reader: FrameReader<File>, mut master: File) -> io::Result<()> {
 
 /// Read bytes from `src`, chunk them into frames on `endpoint`, and write each
 /// whole frame to the shared channel under the lock so frames never interleave.
-fn pump_stdout(mut src: File, mut sink: File) -> io::Result<()> {
+fn pump_stdout(mut src: impl Read, mut sink: File) -> io::Result<()> {
     let mut buf = [0u8; MAX_PAYLOAD];
 
     let mut bytes_read = src.read(&mut buf)?;
@@ -296,19 +313,21 @@ fn wait_for(pid: libc::pid_t) -> io::Result<()> {
     Ok(())
 }
 
-/// Turn an `OsStr` into a `CString` (NUL-terminated), discarding anything
-/// after an embedded NUL — paths/shells never legitimately contain one.
-fn cstr(s: &OsStr) -> CString {
-    CString::new(s.as_bytes()).unwrap_or_else(|e| {
-        let valid = &s.as_bytes()[..e.nul_position()];
-        CString::new(valid).unwrap()
-    })
+fn try_wait_for(pid: libc::pid_t) -> Option<io::Result<()>> {
+    let mut status = 0;
+    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if ret < 0 {
+        return Some(Err(io::Error::last_os_error()));
+    } else if ret > 0 {
+        return Some(Ok(()));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{make_rng, rngs::SmallRng, Rng, RngExt};
+    use rand::{Rng, RngExt, make_rng, rngs::SmallRng};
 
     #[test]
     fn openpty_mirroring() {

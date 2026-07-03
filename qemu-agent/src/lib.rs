@@ -25,8 +25,9 @@ pub mod qemu;
 
 /// Maximum size of a whole frame on the wire (header + payload).
 pub const MAX_FRAME_SIZE: usize = 16384;
+pub const HEADER_SIZE: usize = 3;
 /// Maximum payload length: a frame minus its 3-byte header.
-pub const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - 3; // 16381
+pub const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - HEADER_SIZE; // 16381
 
 /// Logical frame types carried over the single byte stream.
 #[repr(u8)]
@@ -135,10 +136,9 @@ impl Frame {
             return Err(payload_too_large(self.payload.len()));
         }
         let len = self.payload.len() as u16;
-        let mut header = [0u8; 3];
+        let mut header = [0u8; HEADER_SIZE];
         header[0] = self.frame_type as u8;
         header[1..3].copy_from_slice(&len.to_le_bytes());
-        // eprintln!("Sending header: {header:?}");
         w.write_all(&header)?;
         w.write_all(&self.payload)?;
         w.flush()?;
@@ -198,7 +198,6 @@ impl<R: Read> Iterator for FrameReader<R> {
         }
 
         let len = u16::from_le_bytes([header[1], header[2]]) as usize;
-        // eprintln!("Received header:Len: {header:?}, len: {len}");
         if len > MAX_PAYLOAD {
             return Some(Err(payload_too_large(len)));
         }
