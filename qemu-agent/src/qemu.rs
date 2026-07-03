@@ -10,25 +10,31 @@ const OVERLAY: &str = "../rootfs-overlay.qcow2";
 /// Symlink QEMU (re)creates pointing at the allocated pty for the data port.
 pub const CONSOLE: &str = "../console";
 
-/// Launch the microVM under QEMU — a Rust port of `run.sh`.
+pub struct VmLaunchOpts {
+    /// If true stdout/stderr of VM process will be linked to current
+    /// terminal, so that boot logs will be visible.
+    ///
+    /// This only should be used for diagnostic, because it might break terminal working in VM
+    pub dump_boot_log: bool,
+}
+
+/// Launch the microVM under QEMU
 ///
-/// Mirrors the shell script step for step:
 ///   1. remove the stale `./console` pty symlink,
 ///   2. create the qcow2 overlay disk on first run,
 ///   3. `exec` qemu-system-aarch64 with the full device set
 ///      (aarch64/HVF, virtio-serial console + data port, virtio-blk root,
 ///      user-mode net, RNG, a 9p share of the cwd, kernel + initrd).
 ///
-/// Paths are relative to the current working directory, exactly like the
-/// script, so run it from the project root.
-pub fn launch_vm() -> io::Result<()> {
+/// Paths are relative to the current working directory.
+pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
     match fs::remove_file(CONSOLE) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
 
-    // run.sh: create the overlay disk the first time, backed by rootfs.qcow2.
+    // create the overlay disk the first time, backed by rootfs.qcow2.
     if !Path::new(OVERLAY).exists() {
         let status = Command::new("qemu-img")
             .args([
@@ -54,7 +60,8 @@ pub fn launch_vm() -> io::Result<()> {
         pwd.display()
     );
 
-    let mut qemu = Command::new("qemu-system-aarch64")
+    let mut qemu_cmd = Command::new("qemu-system-aarch64");
+    qemu_cmd
         .args([
             // General settings. Using Hypervisor.framework.
             "-accel",
@@ -114,10 +121,13 @@ pub fn launch_vm() -> io::Result<()> {
             "-append",
             "console=hvc0 reboot=t rdinit=/init panic=-1",
         ])
-        .stderr(Stdio::piped())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+        .stdin(Stdio::piped());
+
+    if !opts.dump_boot_log {
+        qemu_cmd.stderr(Stdio::piped()).stdout(Stdio::piped());
+    }
+
+    let mut qemu = qemu_cmd.spawn()?;
     let _ = qemu.stderr.take();
     let _ = qemu.stdin.take();
     qemu.wait_with_output()?;

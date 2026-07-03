@@ -8,7 +8,10 @@
 //! `Ctrl-]` then `q` disconnects locally.
 
 use clap::Parser;
-use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty, qemu};
+use qemu_agent::{
+    Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty,
+    qemu::{self, VmLaunchOpts},
+};
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
     env,
@@ -30,6 +33,10 @@ struct Args {
     /// If specified no VM will be launched automatically. Instead client will connect to a given pty
     #[arg(long = "serial", name = "path")]
     serial: Option<PathBuf>,
+
+    /// Dump VM boot logs to the stdout
+    #[arg(long = "boot-log")]
+    dump_boot_log: bool,
 }
 
 fn main() -> ExitCode {
@@ -37,7 +44,10 @@ fn main() -> ExitCode {
     let (path, join_handle) = if let Some(path) = args.serial {
         (path, None)
     } else {
-        let handle = thread::spawn(qemu::launch_vm);
+        let opts = VmLaunchOpts {
+            dump_boot_log: args.dump_boot_log,
+        };
+        let handle = thread::spawn(move || qemu::launch_vm(opts));
         while !fs::exists(qemu::CONSOLE).unwrap() {
             thread::sleep(Duration::from_millis(50));
         }
