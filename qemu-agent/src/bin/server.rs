@@ -12,6 +12,7 @@ use std::{
     ffi::{CStr, CString},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
+    iter::once,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
@@ -63,7 +64,6 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     let start_frame = Frame::new(FrameType::Start, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
     let channel_writer = client_channel.try_clone()?;
-    let channel_fd = client_channel.as_raw_fd();
     let mut client_channel_reader = FrameReader::new(client_channel);
 
     let (master, slave, _) = open_pty()?;
@@ -103,13 +103,13 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
-        // ---- child ----
-        let close_in_child = [channel_fd, master_fd];
-        exec_shell(slave_fd, &close_in_child, &argv[0], &argv, &envp);
+        // Child
+        drop(master);
+        drop(client_channel_reader);
+        exec_shell(slave_fd, &argv[0], &argv, &envp);
         // exec_shell never returns.
     } else {
-        // ---- parent ----
-        // Hand the slave end and the pipe's write end to the child only.
+        // Parent: hand the slave end and the pipe's write end to the child only.
         drop(slave);
 
         let master_writer = File::from(master);
@@ -207,13 +207,7 @@ fn pump_stdout(mut src: impl Read, mut sink: File) -> io::Result<()> {
 ///
 /// Only async-signal-safe libc calls are used here. The process is
 /// single-threaded at this point (threads are spawned after the fork).
-fn exec_shell(
-    slave_fd: RawFd,
-    close_fds: &[RawFd],
-    prog: &CString,
-    argv: &[CString],
-    envp: &[CString],
-) -> ! {
+fn exec_shell(slave_fd: RawFd, prog: &CString, argv: &[CString], envp: &[CString]) -> ! {
     unsafe {
         if libc::setsid() < 0 {
             libc::_exit(127);
@@ -226,20 +220,20 @@ fn exec_shell(
         libc::dup2(slave_fd, libc::STDOUT_FILENO);
         libc::dup2(slave_fd, libc::STDERR_FILENO);
 
-        // Drop the parent-only fds and the now-duplicated originals.
-        for &fd in close_fds {
-            if fd > libc::STDERR_FILENO {
-                libc::close(fd);
-            }
-        }
         if slave_fd > libc::STDERR_FILENO {
             libc::close(slave_fd);
         }
 
-        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
-        argv_ptrs.push(ptr::null());
-        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
-        envp_ptrs.push(ptr::null());
+        let argv_ptrs: Vec<*const libc::c_char> = argv
+            .iter()
+            .map(|c| c.as_ptr())
+            .chain(once(ptr::null()))
+            .collect();
+        let envp_ptrs: Vec<*const libc::c_char> = envp
+            .iter()
+            .map(|c| c.as_ptr())
+            .chain(once(ptr::null()))
+            .collect();
 
         libc::execve(prog.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
         // Only reached if exec failed.

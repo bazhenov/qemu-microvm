@@ -1,7 +1,9 @@
 /linux-*.tar.xz
 /linux-*/
-/rootfs.*
+/rootfs/sysroot
+/rootfs/busybox-*
+/rootfs/musl-*
+/rootfs/*.tar.gz
 /Image
-/rootfs/init
 /qemu-agent/target
 *.qcow2
