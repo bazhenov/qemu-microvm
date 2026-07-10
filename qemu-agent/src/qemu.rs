@@ -128,6 +128,12 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
     let mut qemu = qemu_cmd.spawn()?;
     let _ = qemu.stderr.take();
     let _ = qemu.stdin.take();
-    qemu.wait_with_output()?;
-    Ok(())
+    let output = qemu.wait_with_output()?;
+    if !output.status.success() {
+        Err(io::Error::other(
+            "VM failed, use --boot-log to inspect details",
+        ))
+    } else {
+        Ok(())
+    }
 }

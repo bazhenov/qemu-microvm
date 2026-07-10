@@ -63,8 +63,13 @@ fn main() -> ExitCode {
             result
         });
         // Waiting util VM has started
-        while !fs::exists(&serial_path).unwrap() {
+        while !fs::exists(&serial_path).unwrap() && !handle.is_finished() {
             thread::sleep(Duration::from_millis(50));
+        }
+        if handle.is_finished() {
+            // VM failed, returning error
+            eprintln!("vm: {:?}", handle.join().unwrap());
+            return ExitCode::FAILURE;
         }
         (serial_path, Some(handle))
     };
