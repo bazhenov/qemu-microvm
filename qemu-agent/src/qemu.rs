@@ -67,14 +67,22 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         pwd.display()
     );
 
-    let mut append = format!(
-        "console=hvc0 reboot=t panic=-1 {} rdinit=/init",
-        if opts.recovery { "init_recovery" } else { "" }
-    );
-    if let Some(value) = format_init_args(&opts)? {
-        append.push_str(" -- ");
-        append.push_str(&value);
+    let mut kernel_opts = vec![
+        "console=hvc0".to_string(),
+        "reboot=t".to_string(),
+        "panic=-1".to_string(),
+        "rdinit=/init".to_string(),
+    ];
+    if opts.recovery {
+        kernel_opts.push("init_recovery".to_string());
     }
+
+    if let Some(value) = format_init_args(&opts)? {
+        kernel_opts.push("--".to_string());
+        kernel_opts.push(value);
+    }
+
+    let kernel_opts = kernel_opts.join(" ");
 
     let mut qemu_cmd = Command::new("qemu-system-aarch64");
 
@@ -133,7 +141,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         .args(["-virtfs", &virtfs])
         // Linux kernel settings
         .args(["-kernel", "../Image", "-initrd", "../initrd.gz"])
-        .args(["-append", &append])
+        .args(["-append", &kernel_opts])
         .stdin(Stdio::piped());
 
     if !opts.dump_boot_log {
