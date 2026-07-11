@@ -23,6 +23,12 @@ pub struct VmLaunchOpts {
 
     /// If true, emulating mode is used, otherwise platform hypervisor is used
     pub emulate: bool,
+
+    /// Command to run in the VM instead of the default login shell.
+    ///
+    /// Passed to the guest init through the kernel command line (everything
+    /// after `--` is handed to init as its arguments). Ignored in recovery mode.
+    pub command: Vec<String>,
 }
 
 /// Launch the microVM under QEMU
@@ -60,6 +66,15 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         "local,path={},mount_tag=qemu,security_model=mapped",
         pwd.display()
     );
+
+    let mut append = format!(
+        "console=hvc0 reboot=t panic=-1 {} rdinit=/init",
+        if opts.recovery { "init_recovery" } else { "" }
+    );
+    if let Some(value) = format_init_args(&opts)? {
+        append.push_str(" -- ");
+        append.push_str(&value);
+    }
 
     let mut qemu_cmd = Command::new("qemu-system-aarch64");
 
@@ -117,17 +132,8 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // VirtIO FS share — path is computed at runtime, so pass it separately
         .args(["-virtfs", &virtfs])
         // Linux kernel settings
-        .args([
-            "-kernel",
-            "../Image",
-            "-initrd",
-            "../initrd.gz",
-            "-append",
-            &format!(
-                "console=hvc0 reboot=t rdinit=/init panic=-1 {}",
-                if opts.recovery { "init_recovery" } else { "" }
-            ),
-        ])
+        .args(["-kernel", "../Image", "-initrd", "../initrd.gz"])
+        .args(["-append", &append])
         .stdin(Stdio::piped());
 
     if !opts.dump_boot_log {
@@ -144,5 +150,34 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+/// init arguments are by convention passed after `--` in the kernel args line
+///
+/// This method formats this arguments line. Result does not contains `--` separate itself
+fn format_init_args(opts: &VmLaunchOpts) -> Result<Option<String>, io::Error> {
+    if opts.command.is_empty() {
+        Ok(None)
+    } else {
+        let mut args_line = String::new();
+        for (idx, arg) in opts.command.iter().enumerate() {
+            if arg.contains('"') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("double quotes are not supported in command arguments: {arg}"),
+                ));
+            }
+            if idx > 0 {
+                args_line.push(' ');
+            }
+            // The kernel tokenizer splits on spaces unless the value is quoted
+            if arg.contains(' ') {
+                args_line.push_str(&format!("\"{arg}\""));
+            } else {
+                args_line.push_str(arg);
+            }
+        }
+        Ok(Some(args_line))
     }
 }

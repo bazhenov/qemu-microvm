@@ -45,6 +45,11 @@ struct Args {
     /// Run in emulation mode (without using hypervisor)
     #[arg(long = "emulate")]
     emulate: bool,
+
+    /// Command to run in the VM instead of the default login shell
+    /// (e.g. `client -- /bin/sh -c 'uname -a'`)
+    #[arg(last = true, name = "command")]
+    command: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -60,6 +65,7 @@ fn main() -> ExitCode {
             serial_path: serial_path.clone(),
             recovery: args.recovery,
             emulate: args.emulate,
+            command: args.command,
         };
         let handle = thread::spawn(move || {
             let result = qemu::launch_vm(opts);

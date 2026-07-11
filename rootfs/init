@@ -24,6 +24,12 @@ hostname sandbox
 if grep -qw "init_recovery" /proc/cmdline; then
     exec /bin/server --serial /dev/vport2p1 /bin/sh
 else
+    # The kernel passes everything after "--" on its command line to init
+    # as arguments; use them as the starting command if present.
+    if [ $# -eq 0 ]; then
+        set -- /usr/bin/login -f root
+    fi
+
     mkdir -p /mnt
     mount /dev/vda /mnt
 
@@ -37,7 +43,7 @@ else
 
     # From now on we do not care about exit code. We stee need to move on
     set +e
-    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport2p1 -- /usr/sbin/chroot /mnt /usr/bin/login -f root
+    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport2p1 -- /usr/sbin/chroot /mnt "$@"
 
     # Moving system mounts back
     # Filesystems should be unmounted in the opposite order
