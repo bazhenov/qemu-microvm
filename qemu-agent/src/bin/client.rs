@@ -41,6 +41,10 @@ struct Args {
     /// Run VM init in a recovery mode
     #[arg(long = "recovery")]
     recovery: bool,
+
+    /// Run in emulation mode (without using hypervisor)
+    #[arg(long = "emulate")]
+    emulate: bool,
 }
 
 fn main() -> ExitCode {
@@ -55,6 +59,7 @@ fn main() -> ExitCode {
             dump_boot_log: args.dump_boot_log,
             serial_path: serial_path.clone(),
             recovery: args.recovery,
+            emulate: args.emulate,
         };
         let handle = thread::spawn(move || {
             let result = qemu::launch_vm(opts);

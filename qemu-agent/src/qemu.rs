@@ -20,6 +20,9 @@ pub struct VmLaunchOpts {
 
     /// Start init in recovery mode
     pub recovery: bool,
+
+    /// If true, emulating mode is used, otherwise platform hypervisor is used
+    pub emulate: bool,
 }
 
 /// Launch the microVM under QEMU
@@ -59,10 +62,16 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
     );
 
     let mut qemu_cmd = Command::new("qemu-system-aarch64");
-    qemu_cmd
+
+    if opts.emulate {
+        qemu_cmd.args(["-cpu", "cortex-a76"]);
+    } else {
         // General settings. Using Hypervisor.framework.
-        .args(["-accel", "hvf", "-cpu", "host"])
-        // General settings. Emulation.
+        qemu_cmd.args(["-accel", "hvf", "-cpu", "host"]);
+    }
+
+    qemu_cmd
+        // General settings.
         .args(["-nodefaults", "-no-user-config", "-nographic", "-no-reboot"])
         // CPU settings
         .args(["-M", "virt", "-smp", "cpus=1,sockets=1,cores=1,threads=1"])
