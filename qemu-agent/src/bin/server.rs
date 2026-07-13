@@ -7,6 +7,7 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
 use clap::Parser;
+use nix::errno::Errno;
 use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
 use std::{
     env,
@@ -125,6 +126,9 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         let master_reader = master_writer.try_clone()?;
 
         let sink = channel_writer;
+        // Second handle to the channel for the final exit frame; used only
+        // after the stdout pump has finished, so frames never interleave.
+        let mut exit_sink = sink.try_clone()?;
 
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -162,18 +166,29 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         // The proper way to solve it is to pass stdout/stderr close() signals via communication protocol
         // (eg. [`Frame`]), so that client can understand stat stdout has been closed, therefore communication
         // channel as a whole needs to be closed.
-        while try_wait_for(child).is_none()
-            && let Ok(r) = done_rx.recv()
-        {
+        let mut status = None;
+        loop {
+            if let Some(s) = try_wait_for(child) {
+                status = Some(s?);
+                break;
+            }
+            let Ok(r) = done_rx.recv() else { break };
             r.expect("Thread failed");
         }
 
-        // Reap the shell. When it dies the PTY master and stderr pipe hit EOF and
-        // the output threads finish; the input thread may still be blocked on the
-        // channel, so we exit the process rather than joining it.
-        let _ = wait_for(child);
+        // Reap the shell (unless WNOHANG already did). When it dies the PTY
+        // master hits EOF and the output threads finish; the input thread may
+        // still be blocked on the channel, so we exit the process rather than
+        // joining it.
+        let status = match status {
+            Some(s) => s,
+            None => wait_for(child)?,
+        };
 
+        // Wait for the remaining output to be flushed, so the exit frame is
+        // the last frame the client sees.
         let _ = stdout_handle.join();
+        Frame::exit(exit_code(status)).write_to(&mut exit_sink)?;
         Ok(())
     }
 }
@@ -202,14 +217,18 @@ fn pump_client_frames(reader: FrameReader<impl Read>, mut tty_master: File) -> i
 fn pump_stdout(mut src: impl Read, mut sink: File) -> io::Result<()> {
     let mut buf = [0u8; MAX_PAYLOAD];
 
-    let mut bytes_read = src.read(&mut buf)?;
-    while bytes_read > 0 {
-        let frame = Frame::new(FrameType::Stdout, buf[..bytes_read].to_vec());
-        frame.write_to(&mut sink)?;
-        bytes_read = src.read(&mut buf)?;
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => Frame::new(FrameType::Stdout, buf[..n].to_vec()).write_to(&mut sink)?,
+            // On Unix systems when child process drops slave part of pty, read doesn't return EOF,
+            // it generate EIO error instead.
+            // Unfortunatley this error code is not stabilized by Rust, so we need to use `Errno` here.
+            // see: https://unix.stackexchange.com/questions/538198/why-blocking-read-on-a-pty-returns-when-process-on-the-other-end-dies
+            Err(_) if Errno::last() == Errno::EIO => break Ok(()),
+            Err(e) => break Err(e),
+        }
     }
-
-    Ok(())
 }
 
 /// Child half of fork/exec. Replaces the process image; never returns.
@@ -307,24 +326,36 @@ fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
     }
 }
 
-/// Block until the given child changes state.
-fn wait_for(pid: libc::pid_t) -> io::Result<()> {
+/// Block until the given child changes state. Returns the raw `waitpid` status.
+fn wait_for(pid: libc::pid_t) -> io::Result<libc::c_int> {
     let mut status = 0;
     if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(status)
 }
 
-fn try_wait_for(pid: libc::pid_t) -> Option<io::Result<()>> {
+fn try_wait_for(pid: libc::pid_t) -> Option<io::Result<libc::c_int>> {
     let mut status = 0;
     let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
     if ret < 0 {
         return Some(Err(io::Error::last_os_error()));
     } else if ret > 0 {
-        return Some(Ok(()));
+        return Some(Ok(status));
     }
     None
+}
+
+/// Map a raw `waitpid` status to a shell-style exit code:
+/// the code itself for a normal exit, `128 + signal` for a killed process.
+fn exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,8 @@ pub enum FrameType {
     Stderr = 4,
     /// terminal resize `cols:u16, rows:u16` (listener: server)
     Resize = 5,
+    /// exit code of the shell process `code:i32` (listener: client)
+    Exit = 6,
 }
 
 impl From<u8> for FrameType {
@@ -57,6 +59,8 @@ impl From<u8> for FrameType {
             FrameType::Stderr
         } else if value == FrameType::Resize as u8 {
             FrameType::Resize
+        } else if value == FrameType::Exit as u8 {
+            FrameType::Exit
         } else {
             FrameType::Unknown
         }
@@ -117,6 +121,25 @@ impl Frame {
         payload.extend_from_slice(&cols.to_le_bytes());
         payload.extend_from_slice(&rows.to_le_bytes());
         Self::new(FrameType::Resize, payload)
+    }
+
+    /// The exit code of the shell process.
+    pub fn exit(code: i32) -> Self {
+        Self::new(FrameType::Exit, code.to_le_bytes().to_vec())
+    }
+
+    /// Decode an exit payload, if this frame is a well-formed exit.
+    pub fn as_exit(&self) -> Option<i32> {
+        if self.frame_type == FrameType::Exit && self.payload.len() == 4 {
+            Some(i32::from_le_bytes([
+                self.payload[0],
+                self.payload[1],
+                self.payload[2],
+                self.payload[3],
+            ]))
+        } else {
+            None
+        }
     }
 
     /// Decode a resize payload, if this frame is a well-formed resize.
@@ -252,6 +275,7 @@ mod tests {
             Frame::stdout(b"hello stdout".to_vec()),
             Frame::stderr(b"hello stderr".to_vec()),
             Frame::resize(80, 24),
+            Frame::exit(42),
         ];
         for frame in &frames {
             assert_eq!(&round_trip(frame), frame);
@@ -268,6 +292,14 @@ mod tests {
     fn resize_payload_decodes() {
         let frame = Frame::resize(120, 40);
         assert_eq!(frame.as_resize(), Some((120, 40)));
+    }
+
+    #[test]
+    fn exit_payload_decodes() {
+        let frame = Frame::exit(137);
+        assert_eq!(frame.as_exit(), Some(137));
+        assert_eq!(Frame::exit(0).as_exit(), Some(0));
+        assert!(Frame::stdout(b"not an exit".to_vec()).as_exit().is_none());
     }
 
     #[test]

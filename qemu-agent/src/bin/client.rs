@@ -90,7 +90,10 @@ fn main() -> ExitCode {
         let _ = handle.join();
     }
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        // Exit code reported by the VM process; absent when the session ended
+        // without one (local escape, channel EOF).
+        Ok(Some(code)) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
+        Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("client: {e}");
             ExitCode::FAILURE
@@ -115,7 +118,7 @@ impl Drop for RawGuard {
     }
 }
 
-fn run(path: &Path) -> io::Result<()> {
+fn run(path: &Path) -> io::Result<Option<i32>> {
     let channel = File::options().read(true).write(true).open(path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
@@ -159,7 +162,7 @@ fn run(path: &Path) -> io::Result<()> {
         thread::Builder::new()
             .name("input_loop".into())
             .spawn(move || {
-                let _ = done.send(input_loop(writer));
+                let _ = done.send(input_loop(writer).map(|()| None));
             })
             .expect("Unable to spawn thread");
     }
@@ -172,7 +175,7 @@ fn run(path: &Path) -> io::Result<()> {
         thread::Builder::new()
             .name("resize_loop".into())
             .spawn(move || {
-                let _ = done.send(resize_loop(writer));
+                let _ = done.send(resize_loop(writer).map(|()| None));
             })
             .expect("Unable to spawn thread");
     }
@@ -182,11 +185,13 @@ fn run(path: &Path) -> io::Result<()> {
 }
 
 /// Decode frames from the channel and write payloads to the local terminal.
-fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
+///
+/// Returns the exit code of the VM process if an [`FrameType::Exit`] frame
+/// arrived before the stream ended.
+fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<Option<i32>> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     for item in reader {
-        // eprintln!("Output loop fired");
         match item {
             Ok(frame) if frame.frame_type == FrameType::Stdout => {
                 if stdout.write_all(&frame.payload).is_err() || stdout.flush().is_err() {
@@ -197,6 +202,14 @@ fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
                 if stderr.write_all(&frame.payload).is_err() || stderr.flush().is_err() {
                     break;
                 }
+            }
+            Ok(frame) if frame.frame_type == FrameType::Exit => {
+                let Some(code) = frame.as_exit() else {
+                    eprintln!("Malformed exit frame: {} bytes", frame.payload.len());
+                    break;
+                };
+                // The exit frame is the last one the server sends.
+                return Ok(Some(code));
             }
             Ok(frame) => {
                 eprintln!("Unknown frame endpoint = {:?}", frame.frame_type);
@@ -209,7 +222,7 @@ fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Read raw stdin, filter the local escape sequence, forward the rest.

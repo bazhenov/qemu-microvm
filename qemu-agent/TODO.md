@@ -4,11 +4,14 @@
 
 ## Backlog
 
-- [ ] proper exit code propagation to a host
 - [ ] proper user initialization (no)
 - [ ] add logging
 - [ ] exiting failing with `pump_to_channel() = I/O error (os error 5)`
 - [ ] add options to specify kernel and path to block device
+
+# Jul 13
+
+- [x] proper exit code propagation to a host
 
 # Jul 11
 
