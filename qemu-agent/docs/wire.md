@@ -34,6 +34,7 @@ magic byte, and no resynchronization mechanism.
 | 3     | `Stdout` | raw bytes from the shell's stdout | client     |
 | 4     | `Stderr` | raw bytes from the shell's stderr | client     |
 | 5     | `Resize` | `cols:u16, rows:u16` (4 bytes)    | server     |
+| 6     | `Exit`   | `code:i32` (4 bytes)              | client     |
 
 Any other type value decodes as `Unknown`. The frame is still read in full so
 the stream stays in sync; the receiver decides whether to drop it.
@@ -45,3 +46,7 @@ the stream stays in sync; the receiver decides whether to drop it.
 - EOF in the middle of a frame (header or payload) is an error
   (`UnexpectedEof`).
 - Empty payloads are valid.
+- `Exit` is the last frame the server sends: it is written only after the
+  shell process has been reaped and all of its remaining output has been
+  flushed to the channel. The code is the shell-style exit status (`128 +
+  signal` if the process was killed).
