@@ -4,6 +4,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+const LINUX_KERNEL: &str = "./linux/arch/arm64/boot/Image";
+
 /// Copy-on-write overlay over the read-only base image.
 const OVERLAY: &str = "rootfs-overlay.qcow2";
 
@@ -47,7 +49,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
             .args([
                 "create",
                 "-o",
-                "backing_file=../rootfs.qcow2,backing_fmt=qcow2",
+                "backing_file=./rootfs.qcow2,backing_fmt=qcow2",
                 "-f",
                 "qcow2",
                 OVERLAY,
@@ -140,7 +142,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // VirtIO FS share — path is computed at runtime, so pass it separately
         .args(["-virtfs", &virtfs])
         // Linux kernel settings
-        .args(["-kernel", "../Image", "-initrd", "../initrd.gz"])
+        .args(["-kernel", LINUX_KERNEL, "-initrd", "./initrd.gz"])
         .args(["-append", &kernel_opts])
         .stdin(Stdio::piped());
 
