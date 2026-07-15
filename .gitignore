@@ -1,4 +1,5 @@
 /linux/
+/linux.tmp/
 /rootfs/sysroot
 /rootfs/busybox-*
 /rootfs/musl-*

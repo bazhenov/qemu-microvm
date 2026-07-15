@@ -1,16 +1,10 @@
 ## Building
 
-1. Downloading Linux kernel
+1. Downloading, extracting Linux kernel and creating kernel config (this can be done on Linux or macOS)
    ```
-   $ make linux
+   $ make linux linux/.config
    ```
-2. Configuring the kernel
+2. Compile the kernel (it has to be done on Linux)
    ```
-   $ cd linux
-   $ make olddefconfig
-   ```
-3. Compile the kernel
-   ```
-   $ cd linux
-   $ make -j$(nproc) // or make -j8 for using 8 cores
+   $ make -C linux -j$(nproc) // or make -C linux -j8 for using 8 cores
    ```
