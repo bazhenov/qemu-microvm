@@ -7,7 +7,7 @@
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
 use clap::Parser;
-use nix::errno::Errno;
+use nix::{errno::Errno, pty};
 use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
 use std::{
     env,
@@ -24,9 +24,7 @@ use std::{
     },
     path::PathBuf,
     process::ExitCode,
-    ptr,
-    sync::mpsc,
-    thread,
+    ptr, thread,
 };
 
 const TTY_PATH: &str = "./tty";
@@ -80,14 +78,10 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     // clients will fail with an error and we would need to spin.
     let start_frame = Frame::new(FrameType::Start, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
-    let channel_writer = client_channel.try_clone()?;
+    let mut channel_writer = client_channel.try_clone()?;
     let mut client_channel_reader = FrameReader::new(client_channel);
 
-    let (master, slave, _) = open_pty()?;
-
-    // Raw fds the child must close so it doesn't inherit the channel/master.
-    let master_fd = master.as_raw_fd();
-    let slave_fd = slave.as_raw_fd();
+    let (pty_master, pty_slave, _) = open_pty()?;
 
     let first_frame = client_channel_reader
         .next()
@@ -95,7 +89,7 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     let Some((cols, rows)) = first_frame.as_resize() else {
         panic!("Unexpected frame: {:?}", first_frame.frame_type);
     };
-    set_winsize(master_fd, cols, rows);
+    set_winsize(pty_master.as_raw_fd(), cols, rows);
 
     // Build exec arguments and environment before forking so the child does
     // no allocation between fork() and execvpe() beyond the pointer arrays.
@@ -106,7 +100,6 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
         .map(CString::new)
         .collect::<Result<Vec<_>, _>>()?;
     let envp = build_env();
-    // eprintln!("Spawning: {:?}", argv);
 
     let child = unsafe { libc::fork() };
     if child < 0 {
@@ -114,94 +107,43 @@ fn run(mut client_channel: File, cmd: &[&str]) -> io::Result<()> {
     }
     if child == 0 {
         // Child
-        drop(master);
+        drop(pty_master);
         drop(client_channel_reader);
-        exec_shell(slave_fd, &argv[0], &argv, &envp);
+        exec_shell(pty_slave.as_raw_fd(), &argv[0], &argv, &envp);
         // exec_shell never returns.
     } else {
         // Parent: hand the slave end and the pipe's write end to the child only.
-        drop(slave);
+        drop(pty_slave);
 
-        let master_writer = File::from(master);
-        let master_reader = master_writer.try_clone()?;
-
-        let sink = channel_writer;
-        // Second handle to the channel for the final exit frame; used only
-        // after the stdout pump has finished, so frames never interleave.
-        let mut exit_sink = sink.try_clone()?;
-
-        let (done_tx, done_rx) = mpsc::channel();
+        let pty_master = File::from(pty_master);
 
         // Channel -> child: decode frames, drive the PTY.
-        let stdin_handle = {
-            let done_tx = done_tx.clone();
+        {
+            let pty_master = pty_master.try_clone()?;
             thread::Builder::new()
                 .name("pump_client_frames".into())
-                .spawn(move || {
-                    let _ = done_tx.send(pump_client_frames(client_channel_reader, master_writer));
-                })
-                .expect("Unable to spawn thread")
-        };
-
-        // PTY master -> channel as stdout frames.
-        let stdout_handle = {
-            let done_tx = done_tx.clone();
-            thread::Builder::new()
-                .name("pump_stdout".into())
-                .spawn(move || {
-                    let _ = done_tx.send(pump_stdout(master_reader, sink));
-                })
-                .expect("Unable to spawn thread")
-        };
-
-        drop(stdin_handle);
-        // done_tx dhould be dropped here, otherwise loop will never finish
-        drop(done_tx);
-
-        // Only waiting while child process is alive. try_wait_for() is workaround for a following problem:
-        //
-        // In ideal world we would wait for both children threads to finish and then reaping child process.
-        // Unfortunatley this is not possible because we need to signal client that child process has exited.
-        //
-        // The proper way to solve it is to pass stdout/stderr close() signals via communication protocol
-        // (eg. [`Frame`]), so that client can understand stat stdout has been closed, therefore communication
-        // channel as a whole needs to be closed.
-        let mut status = None;
-        loop {
-            if let Some(s) = try_wait_for(child) {
-                status = Some(s?);
-                break;
-            }
-            let Ok(r) = done_rx.recv() else { break };
-            r.expect("Thread failed");
+                .spawn(move || pump_client_frames(client_channel_reader, pty_master))
+                .expect("Unable to spawn thread");
         }
 
-        // Reap the shell (unless WNOHANG already did). When it dies the PTY
-        // master hits EOF and the output threads finish; the input thread may
-        // still be blocked on the channel, so we exit the process rather than
-        // joining it.
-        let status = match status {
-            Some(s) => s,
-            None => wait_for(child)?,
-        };
+        // PTY master -> channel as stdout frames.
+        pump_stdout(pty_master, &mut channel_writer)?;
+        let status = wait_for(child)?;
 
-        // Wait for the remaining output to be flushed, so the exit frame is
-        // the last frame the client sees.
-        let _ = stdout_handle.join();
-        Frame::exit(exit_code(status)).write_to(&mut exit_sink)?;
+        Frame::exit(exit_code(status)).write_to(&mut channel_writer)?;
         Ok(())
     }
 }
 
 /// Decode frames from the channel and apply them to the PTY master.
-fn pump_client_frames(reader: FrameReader<impl Read>, mut tty_master: File) -> io::Result<()> {
+fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> io::Result<()> {
     for item in reader {
         let frame = item?;
         if frame.frame_type == FrameType::Stdin {
-            tty_master.write_all(&frame.payload)?;
-            tty_master.flush()?;
+            pty_master.write_all(&frame.payload)?;
+            pty_master.flush()?;
         } else if let Some((cols, rows)) = frame.as_resize() {
-            set_winsize(tty_master.as_raw_fd(), cols, rows);
+            set_winsize(pty_master.as_raw_fd(), cols, rows);
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -214,13 +156,13 @@ fn pump_client_frames(reader: FrameReader<impl Read>, mut tty_master: File) -> i
 
 /// Read bytes from `src`, chunk them into frames on `endpoint`, and write each
 /// whole frame to the shared channel under the lock so frames never interleave.
-fn pump_stdout(mut src: impl Read, mut sink: File) -> io::Result<()> {
+fn pump_stdout(mut src: impl Read, sink: &mut File) -> io::Result<()> {
     let mut buf = [0u8; MAX_PAYLOAD];
 
     loop {
         match src.read(&mut buf) {
             Ok(0) => break Ok(()),
-            Ok(n) => Frame::new(FrameType::Stdout, buf[..n].to_vec()).write_to(&mut sink)?,
+            Ok(n) => Frame::new(FrameType::Stdout, buf[..n].to_vec()).write_to(sink)?,
             // On Unix systems when child process drops slave part of pty, read doesn't return EOF,
             // it generate EIO error instead.
             // Unfortunatley this error code is not stabilized by Rust, so we need to use `Errno` here.
@@ -333,17 +275,6 @@ fn wait_for(pid: libc::pid_t) -> io::Result<libc::c_int> {
         return Err(io::Error::last_os_error());
     }
     Ok(status)
-}
-
-fn try_wait_for(pid: libc::pid_t) -> Option<io::Result<libc::c_int>> {
-    let mut status = 0;
-    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if ret < 0 {
-        return Some(Err(io::Error::last_os_error()));
-    } else if ret > 0 {
-        return Some(Ok(status));
-    }
-    None
 }
 
 /// Map a raw `waitpid` status to a shell-style exit code:
