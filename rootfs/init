@@ -5,6 +5,7 @@ mkdir -p /proc
 mount -t proc proc /proc
 mkdir -p /sys
 mount -t sysfs proc /sys
+mount -t cgroup2 none /sys/fs/cgroup
 mount -t devtmpfs devtmpfs /dev
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
@@ -40,6 +41,8 @@ else
     mount -o move /sys /mnt/sys
     mount -t devtmpfs devtmpfs /mnt/dev
     mount -t devpts devpts /mnt/dev/pts
+    mkdir -p /mnt/dev/shm
+    mount -t tmpfs tmpfs /mnt/dev/shm
 
     # From now on we do not care about exit code. We stee need to move on
     set +e
