@@ -23,7 +23,11 @@ ip link set lo up
 hostname sandbox
 
 if grep -qw "init_recovery" /proc/cmdline; then
-    exec /bin/server --serial /dev/vport2p1 /bin/sh
+    # The number of host-tty device depends on the order of arguments passed to QEMU
+    # Just in case if we meess things up listing all vport devices in recovery mode
+    echo "Serial devices:"
+    ls /dev/vport*
+    exec /bin/server --serial /dev/vport0p1 /bin/sh
 else
     # The kernel passes everything after "--" on its command line to init
     # as arguments; use them as the starting command if present.
@@ -46,7 +50,7 @@ else
 
     # From now on we do not care about exit code. We stee need to move on
     set +e
-    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport2p1 -- /usr/sbin/chroot /mnt "$@"
+    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport0p1 -- /usr/sbin/chroot /mnt "$@"
 
     # Moving system mounts back
     # Filesystems should be unmounted in the opposite order

@@ -31,6 +31,13 @@ pub struct VmLaunchOpts {
     /// Passed to the guest init through the kernel command line (everything
     /// after `--` is handed to init as its arguments). Ignored in recovery mode.
     pub command: Vec<String>,
+
+    /// Additional disk images attached to the VM as virtio-blk devices.
+    ///
+    /// Disks appear in the guest after the root disk in the given order
+    /// (`/dev/vdb`, `/dev/vdc`, ...). Format is inferred from the file
+    /// extension: `.qcow2` — qcow2, anything else — raw.
+    pub additional_disks: Vec<PathBuf>,
 }
 
 /// Launch the microVM under QEMU
@@ -101,26 +108,29 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // CPU settings
         .args(["-M", "virt", "-smp", "cpus=1,sockets=1,cores=1,threads=1"])
         // Memory settings
-        .args(["-m", "1G"])
-        // virtio-serial bus carrying the two ports below
-        .args(["-device", "virtio-serial-device"])
-        // hvc0: console multiplexed onto stdio.
-        .args([
-            "-chardev",
-            "stdio,signal=off,id=console-hvc0",
-            "-device",
-            "virtconsole,chardev=console-hvc0",
-        ])
-        // Data port exposed to the host as the pty.
-        .args([
-            "-chardev",
+        .args(["-m", "1G"]);
+
+    // Additional disk drives (guest sees them as /dev/vdb, /dev/vdc, ...).
+    for (idx, disk) in opts.additional_disks.iter().enumerate() {
+        if !disk.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("disk image not found: {}", disk.display()),
+            ));
+        }
+        let format = disk_format(disk);
+        qemu_cmd.args([
+            "-drive",
             &format!(
-                "pty,signal=off,path={},id=console-hvc1",
-                opts.serial_path.display()
+                "id=disk{idx},file={},format={format},if=none",
+                disk.display()
             ),
             "-device",
-            "virtserialport,chardev=console-hvc1",
-        ])
+            &format!("virtio-blk-device,drive=disk{idx}"),
+        ]);
+    }
+
+    qemu_cmd
         // Root disk drive.
         .args([
             "-drive",
@@ -134,6 +144,29 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
             "virtio-net-device,netdev=net1",
             "-netdev",
             "user,id=net1",
+        ])
+        // It's important to serial devices to be configured last (console and host pty).
+        // We rely on device index (eg vport0p1) to connect VM to host, and devices enumerated by Linux/QEMU
+        // in reverse order, so console options must be last or respective changes might be made to initrd script.
+        //
+        // virtio-serial bus carrying the two ports below
+        .args(["-device", "virtio-serial-device"])
+        // hvc0: console multiplexed onto stdio.
+        .args([
+            "-chardev",
+            "stdio,signal=off,id=console-hvc0",
+            "-device",
+            "virtconsole,chardev=console-hvc0",
+        ])
+        // Data port exposed to the host as the pty.
+        .args([
+            "-chardev",
+            &format!(
+                "pty,signal=off,path={},id=host-pty",
+                opts.serial_path.display()
+            ),
+            "-device",
+            "virtserialport,chardev=host-pty",
         ])
         // Realtime clock. PL031 linux driver is required.
         .args(["-rtc", "base=utc,clock=host"])
@@ -160,6 +193,13 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn disk_format(path: &Path) -> &'static str {
+    match path.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("qcow2") => "qcow2",
+        _ => "raw",
     }
 }
 

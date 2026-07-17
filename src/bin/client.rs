@@ -46,6 +46,11 @@ struct Args {
     #[arg(long = "emulate")]
     emulate: bool,
 
+    /// Attach an additional disk image to the VM (may be given multiple times).
+    /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
+    #[arg(long = "disk", name = "disk")]
+    additional_disks: Vec<PathBuf>,
+
     /// Command to run in the VM instead of the default login shell
     /// (e.g. `client -- /bin/sh -c 'uname -a'`)
     #[arg(last = true, name = "command")]
@@ -66,6 +71,7 @@ fn main() -> ExitCode {
             recovery: args.recovery,
             emulate: args.emulate,
             command: args.command,
+            additional_disks: args.additional_disks,
         };
         let handle = thread::spawn(move || {
             let result = qemu::launch_vm(opts);
