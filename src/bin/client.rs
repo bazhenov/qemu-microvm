@@ -15,7 +15,7 @@ use qemu_agent::{
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write, stdin},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex, mpsc},
@@ -31,8 +31,13 @@ const ESCAPE: u8 = 0x1d;
 #[command(version, about, long_about = None)]
 struct Args {
     /// If specified no VM will be launched automatically. Instead client will connect to a given pty
-    #[arg(long = "serial", name = "path")]
+    #[arg(long = "serial", value_name = "path")]
     serial: Option<PathBuf>,
+
+    /// Path to the root filesystem disk image (format inferred from the extension:
+    /// .qcow2 — qcow2, anything else — raw).
+    #[arg(long = "root-fs", value_name = "disk", default_value = "rootfs.qcow2")]
+    root_fs: PathBuf,
 
     /// Dump VM boot logs to the stdout
     #[arg(long = "boot-log")]
@@ -69,6 +74,8 @@ fn main() -> ExitCode {
             dump_boot_log: args.dump_boot_log,
             serial_path: serial_path.clone(),
             recovery: args.recovery,
+            // enforced by clap via required_unless_present
+            root_fs: args.root_fs,
             emulate: args.emulate,
             command: args.command,
             additional_disks: args.additional_disks,
@@ -112,9 +119,16 @@ fn main() -> ExitCode {
 struct RawGuard;
 
 impl RawGuard {
-    fn enable() -> io::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
+    fn enable() -> Option<Self> {
+        if stdin().is_terminal() {
+            // if stdin is not terminal, crossterm will try to operate on /dev/tty
+            // which is still linked to users terminal even if stdin/stdout was piped.
+            // It breaks tests, so we only enabling raw mode if stdin is a tty
+            let _ = crossterm::terminal::enable_raw_mode();
+            Some(Self)
+        } else {
+            None
+        }
     }
 }
 
@@ -140,7 +154,7 @@ fn run(path: &Path) -> io::Result<Option<i32>> {
     }
     let writer = Arc::new(Mutex::new(channel));
 
-    let _guard = RawGuard::enable()?;
+    let _guard = RawGuard::enable();
 
     // The server is blocked waiting for the initial size; send it first.
     let (cols, rows) = crossterm::terminal::size()?;

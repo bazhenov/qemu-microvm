@@ -6,9 +6,6 @@ use std::{
 
 const LINUX_KERNEL: &str = "./linux/arch/arm64/boot/Image";
 
-/// Copy-on-write overlay over the read-only base image.
-const OVERLAY: &str = "rootfs-overlay.qcow2";
-
 pub struct VmLaunchOpts {
     /// If true stdout/stderr of VM process will be linked to current
     /// terminal, so that boot logs will be visible.
@@ -22,6 +19,15 @@ pub struct VmLaunchOpts {
 
     /// Start init in recovery mode
     pub recovery: bool,
+
+    /// Root filesystem disk image attached as the first virtio-blk device
+    /// (`/dev/vda`).
+    ///
+    /// The disk is booted read-write, the caller is responsible for preparing
+    /// it (and cloning it beforehand if the original must stay intact, e.g.
+    /// with APFS `clonefile`/`cp -c`). Format is inferred from the file
+    /// extension: `.qcow2` — qcow2, anything else — raw.
+    pub root_fs: PathBuf,
 
     /// If true, emulating mode is used, otherwise platform hypervisor is used
     pub emulate: bool,
@@ -43,30 +49,17 @@ pub struct VmLaunchOpts {
 /// Launch the microVM under QEMU
 ///
 ///   1. remove the stale `./console` pty symlink,
-///   2. create the qcow2 overlay disk on first run,
-///   3. `exec` qemu-system-aarch64 with the full device set
+///   2. `exec` qemu-system-aarch64 with the full device set
 ///      (aarch64/HVF, virtio-serial console + data port, virtio-blk root,
 ///      user-mode net, RNG, a 9p share of the cwd, kernel + initrd).
 ///
 /// Paths are relative to the current working directory.
 pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
-    // create the overlay disk the first time, backed by rootfs.qcow2.
-    if !Path::new(OVERLAY).exists() {
-        let status = Command::new("qemu-img")
-            .args([
-                "create",
-                "-o",
-                "backing_file=./rootfs.qcow2,backing_fmt=qcow2",
-                "-f",
-                "qcow2",
-                OVERLAY,
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "qemu-img create failed: {status}"
-            )));
-        }
+    if !opts.root_fs.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root fs image not found: {}", opts.root_fs.display()),
+        ));
     }
 
     // -virtfs local,path=$PWD,... — share the current working directory over 9p.
@@ -134,7 +127,11 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // Root disk drive.
         .args([
             "-drive",
-            &format!("id=root,file={},format=qcow2,if=none", OVERLAY),
+            &format!(
+                "id=root,file={},format={},if=none",
+                opts.root_fs.display(),
+                disk_format(&opts.root_fs)
+            ),
             "-device",
             "virtio-blk-device,drive=root",
         ])
