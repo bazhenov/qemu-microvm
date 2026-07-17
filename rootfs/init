@@ -49,22 +49,13 @@ else
 
     # From now on we do not care about exit code. We stee need to move on
     set +e
-    # This line is very convoluted, so let's break it down:
-    #
-    # 1. because server will allocate a tty we only can move /dev/pts mount after server is already running.
-    #    we can not do it before like with other mount points. Ideally server should does it itself, but it's not
-    #    implemented yet.
-    # 2. we use /bin/sh to run several commands after server is started an dallocated pty
-    # 3. we need to pass entrypoint arguments to chroot ("$@" part), but we can not do it in a straighforward way
-    #    unfortunatley. `chroot /mnt "$@"` will not work, because it will break after shell expansion if there
-    #    were arguments with spaces and double quotes.
-    #
-    # The proper way to solve it probably, is to move `mount -o move` part to the server itself
-    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport0p1 -- /bin/sh -c "mount -o move /dev/pts /mnt/dev/pts; /usr/sbin/chroot /mnt \"\$@\"" -- "$@"
+    # The server allocates its PTY first, then move-mounts /dev/pts to
+    # /mnt/dev/pts, chroots the command into /mnt and moves the mount back
+    # once the command exits.
+    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport0p1 --chroot /mnt -- "$@"
 
     # Moving system mounts back
     # Filesystems should be unmounted in the opposite order
-    mount -o move /mnt/dev/pts /dev/pts
     umount /mnt/dev
     mount -o move /mnt/sys /sys
     mount -o move /mnt/proc /proc
