@@ -29,15 +29,18 @@ The suite has three layers, which can be run separately:
 
 ### Prerequisites for the end-to-end tests
 
-- `qemu-system-aarch64` and `qemu-img` on `PATH`.
+- `qemu-system-aarch64` on `PATH`.
 - A compiled kernel at `./linux/arch/arm64/boot/Image`. Download/configure with `make` (see `Makefile`), then compile with `make -C linux -j$(nproc)` — kernel compilation must be done on Linux.
 - `./initrd.gz` — built by `./build-initrd.sh` (requires the `aarch64-unknown-linux-musl` Rust target and `cpio`).
-- `./rootfs.qcow2` — the base root filesystem image. The overlay disk `rootfs-overlay.qcow2` is created automatically on first run.
+- `./rootfs.qcow2` — the base root filesystem image. Preparing it is the user's
+  responsibility; the client boots the disk passed via `--root-fs` directly
+  (read-write, no overlay). Each e2e test clones the base image into a temp dir
+  (APFS `clonefile` on macOS, plain copy elsewhere), so the base stays pristine.
 
 The e2e tests launch QEMU with paths relative to the project root (the tests set
-`current_dir` themselves). All VM tests share `rootfs-overlay.qcow2`, which QEMU
-write-locks, so they serialize through a mutex — expect them to run one at a time
-and take a while (each boots a full VM under emulation).
+`current_dir` themselves). VM boots under emulation are CPU-heavy, so the tests
+serialize through a mutex — expect them to run one at a time and take a while
+(each boots a full VM under emulation).
 
 If the kernel/initrd/rootfs artifacts are missing, only the e2e tests fail; unit and
 CLI tests still work.
