@@ -47,6 +47,17 @@ else
     mkdir -p /mnt/dev/shm
     mount -t tmpfs tmpfs /mnt/dev/shm
 
+    mkdir -p /mnt/run
+    mount -t tmpfs tmpfs /mnt/run
+
+    # Preparing system DNS resolved
+    if [ -d /mnt/etc ]; then
+        # resolv.conf might be existing and might be a symlink, in which case we need to remove it first
+        rm -f /mnt/etc/resolv.conf
+        # 10.0.2.3 is a default DNS provided by QEMU user networking (eg. `-netdev user`)
+        echo "nameserver 10.0.2.3" > /mnt/etc/resolv.conf
+    fi
+
     # From now on we do not care about exit code. We stee need to move on
     set +e
     # The server allocates its PTY first, then move-mounts /dev/pts to
