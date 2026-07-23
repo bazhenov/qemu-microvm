@@ -1,12 +1,7 @@
-use regex::Regex;
-use std::{
-    env,
-    ffi::OsStr,
-    path::Path,
-    process::{Command, ExitStatus, Output, Stdio},
-    thread,
-    time::Duration,
-};
+mod common;
+
+use common::{command, OutputExt};
+use std::{ffi::OsStr, path::Path, process::Output, thread, time::Duration};
 use tempdir::TempDir;
 
 const CLIENT: &str = env!("CARGO_BIN_EXE_client");
@@ -57,105 +52,4 @@ fn wait_for_path(path: impl AsRef<Path>) {
     while !path.as_ref().exists() {
         thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn command(cmd: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(cmd);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
-}
-
-trait OutputExt {
-    fn status(&self) -> ExitStatus;
-    fn stdout(&self) -> &[u8];
-    fn stderr(&self) -> &[u8];
-
-    #[track_caller]
-    fn assert_success(&self) -> &Self {
-        assert!(
-            self.status().success(),
-            "Expected exit code 0, got {:?}\nstdout: {}\nstderr: {}",
-            self.status(),
-            String::from_utf8_lossy(self.stdout()),
-            String::from_utf8_lossy(self.stderr()),
-        );
-        self
-    }
-
-    fn assert_failure(&self) -> &Self {
-        assert!(
-            !self.status().success(),
-            "Expected non-zero exit code\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(self.stdout()),
-            String::from_utf8_lossy(self.stderr()),
-        );
-        self
-    }
-
-    fn assert_stdout_match(&self, pattern: &str) -> &Self {
-        let re_pattern = format!("(?s)^{}$", compile_pattern(pattern));
-        let re = Regex::new(&re_pattern).expect("Invalid regex");
-        let stdout = String::from_utf8_lossy(self.stdout());
-
-        assert!(
-            re.is_match(&stdout),
-            "Expected stdout to match: {}\nstdout: {}",
-            pattern.trim(),
-            stdout,
-        );
-        self
-    }
-
-    fn assert_stdout_contains(&self, pattern: &str) -> &Self {
-        let re_pattern = format!("(?s){}", compile_pattern(pattern));
-        let re = Regex::new(&re_pattern).expect("Invalid regex");
-        let stdout = String::from_utf8_lossy(self.stdout());
-        let stderr = String::from_utf8_lossy(self.stderr());
-
-        assert!(
-            re.find(&stdout).is_some(),
-            "Expected stdout to contain: {}\n--- STDOUT ---\n{}--- STDERR ---\n{}--------------",
-            pattern,
-            stdout,
-            stderr,
-        );
-        self
-    }
-
-    fn assert_stderr_contains(&self, pattern: &str) -> &Self {
-        let re_pattern = format!("(?si){}", compile_pattern(pattern));
-        let re = Regex::new(&re_pattern).expect("Invalid regex");
-        let stderr = String::from_utf8_lossy(self.stderr());
-
-        assert!(
-            re.find(&stderr).is_some(),
-            "Expected stderr to contain: {}\nstderr: {}",
-            pattern,
-            String::from_utf8_lossy(self.stderr()),
-        );
-        self
-    }
-}
-
-impl OutputExt for Output {
-    fn status(&self) -> ExitStatus {
-        self.status
-    }
-
-    fn stdout(&self) -> &[u8] {
-        &self.stdout
-    }
-
-    fn stderr(&self) -> &[u8] {
-        &self.stderr
-    }
-}
-
-fn compile_pattern(pattern: &str) -> String {
-    let parts = pattern.split("{..}").collect::<Vec<_>>();
-    let escaped = parts.into_iter().map(regex::escape).collect::<Vec<_>>();
-    escaped.join(".+")
 }

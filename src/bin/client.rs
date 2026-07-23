@@ -256,7 +256,10 @@ fn run(path: &Path) -> io::Result<Option<i32>> {
     let _guard = RawGuard::enable();
 
     // The server is blocked waiting for the initial size; send it first.
-    let (cols, rows) = crossterm::terminal::size()?;
+    // Without a controlling terminal (headless run, CI) the size can not be
+    // queried — fall back to a conventional 80x24, non-interactive commands
+    // don't care about it anyway.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     send_frame(&writer, &Frame::resize(cols, rows))?;
 
     // Any thread that finishes (clean disconnect, EOF, or error) signals here;
