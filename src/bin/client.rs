@@ -1,13 +1,17 @@
 //! Client side of the serial multiplexer (Unix).
 //!
-//! Puts the local terminal in raw mode and bridges it to the server over the
-//! framed channel: keystrokes ride endpoint 0, the shell's stdout/stderr come
-//! back on endpoints 1/2, and SIGWINCH is forwarded as resize frames.
+//! Two subcommands:
 //!
-//! Threaded, blocking I/O. The channel device path is the sole argument.
-//! `Ctrl-]` then `q` disconnects locally.
+//! - `init` — set up a new VM environment: clone the root filesystem image
+//!   into the data directory (`./.vm` by default).
+//! - `run` — boot a VM from an initialized data directory, put the local
+//!   terminal in raw mode and bridge it to the server over the framed channel:
+//!   keystrokes ride endpoint 0, the shell's stdout/stderr come back on
+//!   endpoints 1/2, and SIGWINCH is forwarded as resize frames.
+//!
+//! Threaded, blocking I/O. `Ctrl-]` then `q` disconnects locally.
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use qemu_agent::{
     Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty,
     qemu::{self, VmLaunchOpts},
@@ -27,17 +31,45 @@ use tempdir::TempDir;
 /// `Ctrl-]` — begins the local escape sequence.
 const ESCAPE: u8 = 0x1d;
 
+/// Default VM data directory.
+const DEFAULT_DATA_DIR: &str = ".vm";
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Initialize a new VM environment in the data directory
+    Init(InitArgs),
+    /// Run a VM from an already initialized data directory
+    Run(RunArgs),
+}
+
+#[derive(Args, Debug)]
+struct InitArgs {
+    /// VM data directory where the rootfs and related VM data are stored
+    #[arg(long = "data-dir", value_name = "dir", default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    /// Source root filesystem disk image cloned into the data directory
+    /// (format inferred from the extension: .qcow2 — qcow2, anything else — raw).
+    #[arg(long = "root-fs", value_name = "disk", default_value = "rootfs.qcow2")]
+    root_fs: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
+    /// VM data directory previously initialized with `init`
+    #[arg(long = "data-dir", value_name = "dir", default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
     /// If specified no VM will be launched automatically. Instead client will connect to a given pty
     #[arg(long = "serial", value_name = "path")]
     serial: Option<PathBuf>,
-
-    /// Path to the root filesystem disk image (format inferred from the extension:
-    /// .qcow2 — qcow2, anything else — raw).
-    #[arg(long = "root-fs", value_name = "disk", default_value = "rootfs.qcow2")]
-    root_fs: PathBuf,
 
     /// Dump VM boot logs to the stdout
     #[arg(long = "boot-log")]
@@ -57,16 +89,84 @@ struct Args {
     additional_disks: Vec<PathBuf>,
 
     /// Command to run in the VM instead of the default login shell
-    /// (e.g. `client -- /bin/sh -c 'uname -a'`)
+    /// (e.g. `client run -- /bin/sh -c 'uname -a'`)
     #[arg(last = true, name = "command")]
     command: Vec<String>,
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    match Cli::parse().command {
+        Cmd::Init(args) => init_cmd(args),
+        Cmd::Run(args) => run_cmd(args),
+    }
+}
+
+fn init_cmd(args: InitArgs) -> ExitCode {
+    match init_env(&args.data_dir, &args.root_fs) {
+        Ok(root_fs) => {
+            println!(
+                "Initialized VM environment in {} (root fs: {})",
+                args.data_dir.display(),
+                root_fs.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("init: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Create the data directory and clone the source root filesystem image into
+/// it as `rootfs.qcow2` (for a `.qcow2` source) or `rootfs.raw` (anything
+/// else), mirroring how the disk format is inferred from the extension.
+///
+/// On macOS/APFS `fs::copy` uses `clonefile`, so the clone is a cheap COW copy.
+fn init_env(data_dir: &Path, src_root_fs: &Path) -> io::Result<PathBuf> {
+    if !src_root_fs.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root fs image not found: {}", src_root_fs.display()),
+        ));
+    }
+    if let Some(existing) = find_root_fs(data_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("VM environment already initialized: {}", existing.display()),
+        ));
+    }
+    fs::create_dir_all(data_dir)?;
+    let file_name = match src_root_fs.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("qcow2") => "rootfs.qcow2",
+        _ => "rootfs.raw",
+    };
+    let dst = data_dir.join(file_name);
+    fs::copy(src_root_fs, &dst)?;
+    Ok(dst)
+}
+
+/// Locate the root filesystem image in the data directory: `rootfs.qcow2`
+/// takes priority over `rootfs.raw`. `None` means the environment is not
+/// initialized.
+fn find_root_fs(data_dir: &Path) -> Option<PathBuf> {
+    ["rootfs.qcow2", "rootfs.raw"]
+        .iter()
+        .map(|name| data_dir.join(name))
+        .find(|path| path.is_file())
+}
+
+fn run_cmd(args: RunArgs) -> ExitCode {
     let (path, join_handle) = if let Some(path) = args.serial {
         (path, None)
     } else {
+        let Some(root_fs) = find_root_fs(&args.data_dir) else {
+            eprintln!(
+                "run: VM environment is not initialized in {}, run `client init` first",
+                args.data_dir.display()
+            );
+            return ExitCode::FAILURE;
+        };
         // Private temporary VM directory to hold intermediate VM artifacts
         let private_dir = TempDir::new("vm").unwrap();
         let serial_path = private_dir.path().join("vm-server");
@@ -74,8 +174,7 @@ fn main() -> ExitCode {
             dump_boot_log: args.dump_boot_log,
             serial_path: serial_path.clone(),
             recovery: args.recovery,
-            // enforced by clap via required_unless_present
-            root_fs: args.root_fs,
+            root_fs,
             emulate: args.emulate,
             command: args.command,
             additional_disks: args.additional_disks,
@@ -98,7 +197,7 @@ fn main() -> ExitCode {
         (serial_path, Some(handle))
     };
 
-    let result = run(&path);
+    let result = session(&path);
     if let Some(handle) = join_handle {
         let _ = handle.join();
     }
@@ -138,7 +237,8 @@ impl Drop for RawGuard {
     }
 }
 
-fn run(path: &Path) -> io::Result<Option<i32>> {
+/// Bridge the local terminal to the server over the framed channel at `path`.
+fn session(path: &Path) -> io::Result<Option<i32>> {
     let channel = File::options().read(true).write(true).open(path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
@@ -371,5 +471,80 @@ mod tests {
         assert_eq!(out, &[ESCAPE]);
         assert!(!quit);
         assert!(escaped);
+    }
+
+    #[test]
+    fn init_env_clones_root_fs_into_data_dir() {
+        let tmp = TempDir::new("init-env").unwrap();
+        let src = tmp.path().join("base.qcow2");
+        fs::write(&src, b"disk image").unwrap();
+        let data_dir = tmp.path().join("vm");
+
+        let root_fs = init_env(&data_dir, &src).unwrap();
+
+        assert_eq!(root_fs, data_dir.join("rootfs.qcow2"));
+        assert_eq!(fs::read(&root_fs).unwrap(), b"disk image");
+        assert_eq!(find_root_fs(&data_dir), Some(root_fs));
+    }
+
+    #[test]
+    fn init_env_stores_non_qcow2_source_as_raw() {
+        let tmp = TempDir::new("init-env").unwrap();
+        let src = tmp.path().join("base.img");
+        fs::write(&src, b"raw image").unwrap();
+        let data_dir = tmp.path().join("vm");
+
+        let root_fs = init_env(&data_dir, &src).unwrap();
+        assert_eq!(root_fs, data_dir.join("rootfs.raw"));
+        assert_eq!(find_root_fs(&data_dir), Some(root_fs));
+    }
+
+    #[test]
+    fn find_root_fs_prefers_qcow2_over_raw() {
+        let tmp = TempDir::new("find-root-fs").unwrap();
+        fs::write(tmp.path().join("rootfs.raw"), b"raw").unwrap();
+        fs::write(tmp.path().join("rootfs.qcow2"), b"qcow2").unwrap();
+
+        assert_eq!(
+            find_root_fs(tmp.path()),
+            Some(tmp.path().join("rootfs.qcow2"))
+        );
+    }
+
+    #[test]
+    fn find_root_fs_ignores_unrelated_files() {
+        let tmp = TempDir::new("find-root-fs").unwrap();
+        fs::write(tmp.path().join("rootfs.img"), b"unsupported").unwrap();
+        fs::write(tmp.path().join("other.qcow2"), b"unrelated").unwrap();
+
+        assert_eq!(find_root_fs(tmp.path()), None);
+    }
+
+    #[test]
+    fn init_env_fails_if_already_initialized() {
+        let tmp = TempDir::new("init-env").unwrap();
+        let src = tmp.path().join("base.qcow2");
+        fs::write(&src, b"disk image").unwrap();
+        let data_dir = tmp.path().join("vm");
+
+        init_env(&data_dir, &src).unwrap();
+        let err = init_env(&data_dir, &src).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn init_env_fails_if_source_is_missing() {
+        let tmp = TempDir::new("init-env").unwrap();
+        let err = init_env(&tmp.path().join("vm"), &tmp.path().join("no-such.qcow2")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn find_root_fs_on_uninitialized_dir() {
+        let tmp = TempDir::new("find-root-fs").unwrap();
+        // Missing directory
+        assert_eq!(find_root_fs(&tmp.path().join("vm")), None);
+        // Existing but empty directory
+        assert_eq!(find_root_fs(tmp.path()), None);
     }
 }

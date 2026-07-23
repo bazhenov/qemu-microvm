@@ -40,7 +40,7 @@ fn run_tty_test(args: &[impl AsRef<OsStr>]) -> Output {
     wait_for_path(tmp_dir.path().join("tty"));
 
     let mut child = command(CLIENT)
-        .args(["--serial", "./tty"])
+        .args(["run", "--serial", "./tty"])
         .current_dir(tmp_dir.path())
         .spawn()
         .unwrap();

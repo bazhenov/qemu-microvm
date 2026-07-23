@@ -172,7 +172,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // VirtIO FS share — path is computed at runtime, so pass it separately
         .args(["-virtfs", &virtfs])
         // Linux kernel settings
-        .args(["-kernel", LINUX_KERNEL, "-initrd", "./initrd.gz"])
+        .args(["-kernel", LINUX_KERNEL, "-initrd", "./target/initrd.gz"])
         .args(["-append", &kernel_opts])
         .stdin(Stdio::piped());
 

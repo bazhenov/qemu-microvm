@@ -5,4 +5,5 @@
 /rootfs/musl-*
 /rootfs/*.tar.gz
 /target
+/.vm/
 *.qcow2
