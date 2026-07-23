@@ -62,7 +62,11 @@ fn init_and_run() {
     );
 
     // `run` boots a VM from the initialized environment
-    let output = run_in_vm(&data_dir, &[], &["/bin/sh", "-c", "echo running in $(hostname)"]);
+    let output = run_in_vm(
+        &data_dir,
+        &[],
+        &["/bin/sh", "-c", "echo running in $(hostname)"],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

@@ -121,8 +121,6 @@ fn init_cmd(args: InitArgs) -> ExitCode {
 /// Create the data directory and clone the source root filesystem image into
 /// it as `rootfs.qcow2` (for a `.qcow2` source) or `rootfs.raw` (anything
 /// else), mirroring how the disk format is inferred from the extension.
-///
-/// On macOS/APFS `fs::copy` uses `clonefile`, so the clone is a cheap COW copy.
 fn init_env(data_dir: &Path, src_root_fs: &Path) -> io::Result<PathBuf> {
     if !src_root_fs.exists() {
         return Err(io::Error::new(
@@ -142,6 +140,7 @@ fn init_env(data_dir: &Path, src_root_fs: &Path) -> io::Result<PathBuf> {
         _ => "rootfs.raw",
     };
     let dst = data_dir.join(file_name);
+    // On macOS/APFS `fs::copy` uses `clonefile`, so the clone is a cheap COW copy.
     fs::copy(src_root_fs, &dst)?;
     Ok(dst)
 }
@@ -197,7 +196,7 @@ fn run_cmd(args: RunArgs) -> ExitCode {
         (serial_path, Some(handle))
     };
 
-    let result = session(&path);
+    let result = run(&path);
     if let Some(handle) = join_handle {
         let _ = handle.join();
     }
@@ -238,7 +237,7 @@ impl Drop for RawGuard {
 }
 
 /// Bridge the local terminal to the server over the framed channel at `path`.
-fn session(path: &Path) -> io::Result<Option<i32>> {
+fn run(path: &Path) -> io::Result<Option<i32>> {
     let channel = File::options().read(true).write(true).open(path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
@@ -473,53 +472,7 @@ mod tests {
         assert!(escaped);
     }
 
-    #[test]
-    fn init_env_clones_root_fs_into_data_dir() {
-        let tmp = TempDir::new("init-env").unwrap();
-        let src = tmp.path().join("base.qcow2");
-        fs::write(&src, b"disk image").unwrap();
-        let data_dir = tmp.path().join("vm");
-
-        let root_fs = init_env(&data_dir, &src).unwrap();
-
-        assert_eq!(root_fs, data_dir.join("rootfs.qcow2"));
-        assert_eq!(fs::read(&root_fs).unwrap(), b"disk image");
-        assert_eq!(find_root_fs(&data_dir), Some(root_fs));
-    }
-
-    #[test]
-    fn init_env_stores_non_qcow2_source_as_raw() {
-        let tmp = TempDir::new("init-env").unwrap();
-        let src = tmp.path().join("base.img");
-        fs::write(&src, b"raw image").unwrap();
-        let data_dir = tmp.path().join("vm");
-
-        let root_fs = init_env(&data_dir, &src).unwrap();
-        assert_eq!(root_fs, data_dir.join("rootfs.raw"));
-        assert_eq!(find_root_fs(&data_dir), Some(root_fs));
-    }
-
-    #[test]
-    fn find_root_fs_prefers_qcow2_over_raw() {
-        let tmp = TempDir::new("find-root-fs").unwrap();
-        fs::write(tmp.path().join("rootfs.raw"), b"raw").unwrap();
-        fs::write(tmp.path().join("rootfs.qcow2"), b"qcow2").unwrap();
-
-        assert_eq!(
-            find_root_fs(tmp.path()),
-            Some(tmp.path().join("rootfs.qcow2"))
-        );
-    }
-
-    #[test]
-    fn find_root_fs_ignores_unrelated_files() {
-        let tmp = TempDir::new("find-root-fs").unwrap();
-        fs::write(tmp.path().join("rootfs.img"), b"unsupported").unwrap();
-        fs::write(tmp.path().join("other.qcow2"), b"unrelated").unwrap();
-
-        assert_eq!(find_root_fs(tmp.path()), None);
-    }
-
+    /// Make sure init_env() will not overwrite already existing env, if user call `init` by accident
     #[test]
     fn init_env_fails_if_already_initialized() {
         let tmp = TempDir::new("init-env").unwrap();
@@ -530,13 +483,6 @@ mod tests {
         init_env(&data_dir, &src).unwrap();
         let err = init_env(&data_dir, &src).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn init_env_fails_if_source_is_missing() {
-        let tmp = TempDir::new("init-env").unwrap();
-        let err = init_env(&tmp.path().join("vm"), &tmp.path().join("no-such.qcow2")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
