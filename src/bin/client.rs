@@ -255,7 +255,12 @@ fn run(path: &Path) -> io::Result<Option<i32>> {
 
     let _guard = RawGuard::enable();
 
-    // The server is blocked waiting for the initial size; send it first.
+    // The server is blocked waiting for the start reply and the initial
+    // size; send them first. `tty_allocate` tells the server whether the
+    // shell needs full terminal semantics (echo): only when our own stdin
+    // is a terminal, piped input must not be echoed back.
+    send_frame(&writer, &Frame::start_reply(stdin().is_terminal()))?;
+
     // Without a controlling terminal (headless run, CI) the size can not be
     // queried — fall back to a conventional 80x24, non-interactive commands
     // don't care about it anyway.
@@ -283,8 +288,16 @@ fn run(path: &Path) -> io::Result<Option<i32>> {
         let done = done_tx.clone();
         thread::Builder::new()
             .name("input_loop".into())
-            .spawn(move || {
-                let _ = done.send(input_loop(writer).map(|()| None));
+            .spawn(move || match input_loop(writer) {
+                // Stdin EOF does not end the session: the command is still
+                // running and its exit frame arrives on the output loop.
+                Ok(false) => {}
+                Ok(true) => {
+                    let _ = done.send(Ok(None));
+                }
+                Err(e) => {
+                    let _ = done.send(Err(e));
+                }
             })
             .expect("Unable to spawn thread");
     }
@@ -348,20 +361,27 @@ fn output_loop<R: Read>(reader: FrameReader<R>) -> io::Result<Option<i32>> {
 }
 
 /// Read raw stdin, filter the local escape sequence, forward the rest.
-fn input_loop(writer: Arc<Mutex<File>>) -> io::Result<()> {
+///
+/// Returns `true` if the user quit the session with the escape sequence.
+/// On stdin EOF an empty stdin frame is sent so the server can propagate
+/// EOF to the command, and `false` is returned: the session goes on.
+fn input_loop(writer: Arc<Mutex<File>>) -> io::Result<bool> {
     let mut stdin = io::stdin();
     let mut buf = [0u8; MAX_PAYLOAD];
     let mut escaped = false;
     loop {
         match stdin.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                let _ = send_frame(&writer, &Frame::stdin_eof());
+                break Ok(false);
+            }
             Ok(n) => {
                 let (payload, quit) = filter_escape(&buf[..n], &mut escaped);
                 if !payload.is_empty() && send_frame(&writer, &Frame::stdin(payload)).is_err() {
-                    break;
+                    break Ok(false);
                 }
                 if quit {
-                    break;
+                    break Ok(true);
                 }
             }
             Err(e)
@@ -371,10 +391,9 @@ fn input_loop(writer: Arc<Mutex<File>>) -> io::Result<()> {
                 thread::yield_now();
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => break Err(e),
         }
     }
-    Ok(())
 }
 
 /// Re-query the terminal size on every SIGWINCH and forward it.

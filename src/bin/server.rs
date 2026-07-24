@@ -9,7 +9,7 @@
 use clap::Parser;
 use libc::c_char;
 use nix::errno::Errno;
-use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
+use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty, disable_echo};
 use std::{
     env,
     ffi::{CStr, CString},
@@ -89,11 +89,29 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
 
     let (pty_master, pty_slave, _) = open_pty()?;
 
-    let first_frame = client_channel_reader
+    // The client opens with a start reply telling whether it stands for a
+    // real terminal. When it does not (stdin is piped), input must not be
+    // echoed back into the output. A client that starts directly with a
+    // resize gets full terminal semantics by default.
+    let start_reply_frame = client_channel_reader
+        .next()
+        .expect("channel closed before start reply")?;
+    let Some(tty_allocate) = start_reply_frame.as_start_reply() else {
+        panic!(
+            "Unexpected frame ({:?} expected): {:?}",
+            FrameType::StartReply,
+            start_reply_frame
+        );
+    };
+    if !tty_allocate {
+        disable_echo(&pty_slave)?;
+    }
+
+    let resize_frame = client_channel_reader
         .next()
         .expect("channel closed before initial resize")?;
-    let Some((cols, rows)) = first_frame.as_resize() else {
-        panic!("Unexpected frame: {:?}", first_frame.frame_type);
+    let Some((cols, rows)) = resize_frame.as_resize() else {
+        panic!("Unexpected frame: {:?}", resize_frame.frame_type);
     };
     set_winsize(pty_master.as_raw_fd(), cols, rows);
 
@@ -162,10 +180,10 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
 
         // Move devpts back even if pumping or waiting failed, so the old root
         // is left the way we found it.
-        if let Some(target) = &devpts_target {
-            if let Err(e) = move_mount(target, Path::new("/dev/pts")) {
-                eprintln!("server: unable to move devpts back: {e}");
-            }
+        if let Some(target) = &devpts_target
+            && let Err(e) = move_mount(target, Path::new("/dev/pts"))
+        {
+            eprintln!("server: unable to move devpts back: {e}");
         }
         pump_result?;
 
@@ -174,12 +192,32 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
     }
 }
 
+/// The default `VEOF` control character (`Ctrl-D`).
+const EOF_CHAR: u8 = 0x04;
+
 /// Decode frames from the channel and apply them to the PTY master.
 fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> io::Result<()> {
+    // In canonical mode VEOF produces EOF (a zero-length read) only at the
+    // start of a line; written mid-line it just flushes the partial line to
+    // the reader. Track where we are to know how many VEOFs EOF takes.
+    let mut at_line_start = true;
     for item in reader {
         let frame = item?;
         if frame.frame_type == FrameType::Stdin {
-            pty_master.write_all(&frame.payload)?;
+            if frame.payload.is_empty() {
+                // The client's stdin reached EOF. The PTY master can not be
+                // closed (it also carries the command's output), so emit the
+                // EOF character instead; a pending partial line takes an
+                // extra one to flush it first.
+                if !at_line_start {
+                    pty_master.write_all(&[EOF_CHAR])?;
+                }
+                pty_master.write_all(&[EOF_CHAR])?;
+            } else {
+                pty_master.write_all(&frame.payload)?;
+                // ICRNL is on by default, so `\r` terminates a line too.
+                at_line_start = matches!(frame.payload.last(), Some(b'\n') | Some(b'\r'));
+            }
             pty_master.flush()?;
         } else if let Some((cols, rows)) = frame.as_resize() {
             set_winsize(pty_master.as_raw_fd(), cols, rows);

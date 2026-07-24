@@ -35,7 +35,8 @@ pub const MAX_PAYLOAD: usize = MAX_FRAME_SIZE - HEADER_SIZE; // 16381
 pub enum FrameType {
     Unknown,
     Start = 1,
-    /// stdin bytes for the shell (listener: server)
+    /// stdin bytes for the shell (listener: server). An empty payload
+    /// signals EOF of the client's stdin: no more input will follow.
     Stdin = 2,
     /// stdout bytes from the shell (listener: client)
     Stdout = 3,
@@ -45,6 +46,10 @@ pub enum FrameType {
     Resize = 5,
     /// exit code of the shell process `code:i32` (listener: client)
     Exit = 6,
+    /// client's reply to [`FrameType::Start`]: `tty_allocate:u8` flag
+    /// (listener: server). When the flag is 0 the client's stdin is not a
+    /// terminal and the shell's PTY should not behave like one (no echo).
+    StartReply = 7,
 }
 
 impl From<u8> for FrameType {
@@ -61,6 +66,8 @@ impl From<u8> for FrameType {
             FrameType::Resize
         } else if value == FrameType::Exit as u8 {
             FrameType::Exit
+        } else if value == FrameType::StartReply as u8 {
+            FrameType::StartReply
         } else {
             FrameType::Unknown
         }
@@ -105,6 +112,11 @@ impl Frame {
         Self::new(FrameType::Stdin, bytes.into())
     }
 
+    /// EOF of the client's stdin (an empty stdin frame).
+    pub fn stdin_eof() -> Self {
+        Self::new(FrameType::Stdin, Vec::new())
+    }
+
     /// stdout bytes from the shell.
     pub fn stdout(bytes: impl Into<Vec<u8>>) -> Self {
         Self::new(FrameType::Stdout, bytes.into())
@@ -126,6 +138,21 @@ impl Frame {
     /// The exit code of the shell process.
     pub fn exit(code: i32) -> Self {
         Self::new(FrameType::Exit, code.to_le_bytes().to_vec())
+    }
+
+    /// The client's reply to a start frame: whether the shell needs a fully
+    /// allocated terminal (the client's stdin is a terminal itself).
+    pub fn start_reply(tty_allocate: bool) -> Self {
+        Self::new(FrameType::StartReply, vec![tty_allocate as u8])
+    }
+
+    /// Decode a start reply payload, if this frame is a well-formed one.
+    pub fn as_start_reply(&self) -> Option<bool> {
+        if self.frame_type == FrameType::StartReply && self.payload.len() == 1 {
+            Some(self.payload[0] != 0)
+        } else {
+            None
+        }
     }
 
     /// Decode an exit payload, if this frame is a well-formed exit.
@@ -254,6 +281,21 @@ pub fn configure_raw_pty(tty: &impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Disable echo on a PTY, keeping canonical mode (and the rest of the line
+/// discipline) intact.
+///
+/// The line discipline echoes everything written to the master back to it:
+/// the command's output gets polluted with a copy of its input (plus control
+/// characters like the VEOF `^D`), which piped input is not supposed to
+/// produce. Programs that draw their own input line (readline shells like
+/// bash) are unaffected.
+pub fn disable_echo(tty: &impl AsFd) -> io::Result<()> {
+    let mut tio = termios::tcgetattr(tty)?;
+    tio.local_flags.remove(termios::LocalFlags::ECHO);
+    termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +318,8 @@ mod tests {
             Frame::stderr(b"hello stderr".to_vec()),
             Frame::resize(80, 24),
             Frame::exit(42),
+            Frame::start_reply(true),
+            Frame::start_reply(false),
         ];
         for frame in &frames {
             assert_eq!(&round_trip(frame), frame);
@@ -292,6 +336,13 @@ mod tests {
     fn resize_payload_decodes() {
         let frame = Frame::resize(120, 40);
         assert_eq!(frame.as_resize(), Some((120, 40)));
+    }
+
+    #[test]
+    fn start_reply_payload_decodes() {
+        assert_eq!(Frame::start_reply(true).as_start_reply(), Some(true));
+        assert_eq!(Frame::start_reply(false).as_start_reply(), Some(false));
+        assert!(Frame::resize(80, 24).as_start_reply().is_none());
     }
 
     #[test]

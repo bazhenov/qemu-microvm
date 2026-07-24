@@ -12,11 +12,14 @@
 
 mod common;
 
-use common::OutputExt;
+use common::{OutputExt, wait_with_timeout};
 use std::{
     fs::File,
+    io::Write,
     path::Path,
     process::{Command, Output},
+    thread,
+    time::Duration,
 };
 use tempdir::TempDir;
 
@@ -29,7 +32,7 @@ fn init_and_run() {
     let data_dir = tmp.path().join("vm");
 
     // `run` on an uninitialized data directory must fail without booting a VM
-    run_in_vm(&data_dir, &[], &["/bin/sh", "-c", "true"])
+    run_in_vm(&data_dir, &[], None, &["/bin/sh", "-c", "true"])
         .assert_failure()
         .assert_stderr_contains("not initialized");
 
@@ -50,6 +53,7 @@ fn init_and_run() {
     run_in_vm(
         &data_dir,
         &[],
+        None,
         &["/bin/sh", "-c", "echo running in $(hostname)"],
     )
     .assert_success()
@@ -62,7 +66,18 @@ fn md5sum_in_vm() {
     let data_dir = tmp.path().join("vm");
     init_env(&data_dir);
 
-    run_in_vm(&data_dir, &[], &["/bin/sh", "-c", "echo Hi | md5sum"])
+    run_in_vm(&data_dir, &[], None, &["/bin/sh", "-c", "echo Hi | md5sum"])
+        .assert_success()
+        .assert_stdout_contains("31ebdfce8b77ac49d7f5506dd1495830");
+}
+
+#[test]
+fn using_stdin() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    run_in_vm(&data_dir, &[], Some("Hi\n"), &["/bin/sh", "-c", "md5sum"])
         .assert_success()
         .assert_stdout_contains("31ebdfce8b77ac49d7f5506dd1495830");
 }
@@ -79,6 +94,7 @@ fn additional_disk_in_vm() {
     run_in_vm(
         &data_dir,
         &[disk.as_path()],
+        None,
         &["/bin/sh", "-c", "cat /sys/block/vdb/size"],
     )
     .assert_success()
@@ -107,7 +123,7 @@ fn init_env(data_dir: &Path) {
 
 /// Run `cmd` in a VM booted from the `data_dir` environment and return its
 /// output.
-fn run_in_vm(data_dir: &Path, disks: &[&Path], cmd: &[&str]) -> Output {
+fn run_in_vm(data_dir: &Path, disks: &[&Path], stdin_value: Option<&str>, cmd: &[&str]) -> Output {
     let mut command = client();
     command
         .arg("run")
@@ -118,9 +134,20 @@ fn run_in_vm(data_dir: &Path, disks: &[&Path], cmd: &[&str]) -> Output {
         command.arg("--disk").arg(disk);
     }
     let mut child = command.arg("--").args(cmd).spawn().unwrap();
-    // We need to hold input until end of the test
-    let _stdin = child.stdin.take().unwrap();
-    child.wait_with_output().unwrap()
+
+    let mut stdin = child.stdin.take().unwrap();
+    if let Some(stdin_value) = stdin_value {
+        let _ = stdin.write_all(stdin_value.as_bytes());
+    }
+    // Close the pipe, otherwise the client never sees stdin EOF
+    drop(stdin);
+
+    wait_with_timeout(child, "qemu")
+}
+
+#[test]
+fn test_foo() {
+    thread::sleep(Duration::from_secs(2));
 }
 
 /// Create an empty (sparse) raw disk image of the given size in bytes.

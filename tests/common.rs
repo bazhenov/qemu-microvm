@@ -8,8 +8,26 @@
 use regex::Regex;
 use std::{
     ffi::OsStr,
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+/// How long a process is allowed to run in tests before it is considered hung.
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+#[track_caller]
+pub fn wait_with_timeout(mut child: Child, name: &str) -> Output {
+    let deadline = Instant::now() + TIMEOUT;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("{name} did not exit within {TIMEOUT:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
 
 /// `Command` with stdin/stdout/stderr piped.
 pub fn command(cmd: impl AsRef<OsStr>) -> Command {
