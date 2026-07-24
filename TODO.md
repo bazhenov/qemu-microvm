@@ -1,5 +1,6 @@
 ## In progress
 
+- [ ] using stdin
 - [ ] provide a way to build rootfs
 
 ## Backlog
