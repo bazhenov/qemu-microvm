@@ -321,7 +321,7 @@ fn run_with_pipes(
             thread::Builder::new()
                 .name("pump_stderr".into())
                 .spawn(move || pump_output(File::from(stderr_read), FrameType::Stderr, &channel))
-                .expect("Unable to spawn thread")
+                .expect("Unable to spawn \thread")
         };
 
         // Child stdout -> channel as stdout frames.
@@ -363,11 +363,6 @@ fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> i
             pty_master.flush()?;
         } else if let Some((cols, rows)) = frame.as_resize() {
             set_winsize(pty_master.as_raw_fd(), cols, rows);
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unexpected frame type: {:?}", frame.frame_type),
-            ));
         }
     }
     Ok(())
@@ -377,22 +372,19 @@ fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> i
 /// stdin pipe. An empty stdin frame (the client's stdin reached EOF) closes
 /// the write end so the command sees EOF. Resize frames are ignored: there
 /// is no terminal to resize.
-fn pump_client_frames_to_pipe(reader: FrameReader<impl Read>, stdin_pipe: File) -> io::Result<()> {
-    let mut stdin_pipe = Some(stdin_pipe);
+fn pump_client_frames_to_pipe(
+    reader: FrameReader<impl Read>,
+    mut stdin_pipe: File,
+) -> io::Result<()> {
     for item in reader {
         let frame = item?;
         if frame.frame_type == FrameType::Stdin {
             if frame.payload.is_empty() {
-                stdin_pipe = None;
-            } else if let Some(pipe) = stdin_pipe.as_mut() {
-                pipe.write_all(&frame.payload)?;
-                pipe.flush()?;
+                break;
+            } else {
+                stdin_pipe.write_all(&frame.payload)?;
+                stdin_pipe.flush()?;
             }
-        } else if frame.as_resize().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unexpected frame type: {:?}", frame.frame_type),
-            ));
         }
     }
     Ok(())
