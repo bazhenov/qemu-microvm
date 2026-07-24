@@ -1,15 +1,20 @@
 //! Server side of the serial multiplexer (Linux).
 //!
-//! Hosts an interactive shell behind a PTY and forwards it over a single
-//! framed channel. stdin/stdout ride the PTY (so terminal semantics work);
-//! stderr rides a separate pipe so endpoint 2 carries genuine stderr bytes.
+//! Executes a command and forwards its I/O over a single framed channel.
+//! The client's start reply tells whether it stands for a real terminal,
+//! and that decides how the command's stdio is wired:
+//!
+//! - a terminal: the command runs behind a freshly allocated PTY (controlling
+//!   terminal, line discipline, resize), stdout and stderr share the PTY;
+//! - no terminal (the client's stdin is piped): the command gets three plain
+//!   pipes, bytes pass through byte-exact and stderr rides its own endpoint.
 //!
 //! Threaded, blocking I/O. The channel device path is the sole argument.
 
 use clap::Parser;
 use libc::c_char;
 use nix::errno::Errno;
-use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty, disable_echo};
+use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
 use std::{
     env,
     ffi::{CStr, CString},
@@ -25,7 +30,9 @@ use std::{
     },
     path::{Path, PathBuf},
     process::ExitCode,
-    ptr, thread,
+    ptr,
+    sync::{Arc, Mutex},
+    thread,
 };
 
 const TTY_PATH: &str = "./tty";
@@ -78,21 +85,30 @@ fn main() -> ExitCode {
     exit_code
 }
 
+/// How the command's stdio is wired, decided by the client's start reply.
+enum Stdio {
+    /// A PTY pair: the command gets the slave as its controlling terminal.
+    Tty { master: OwnedFd, slave: OwnedFd },
+    /// One plain pipe per stream, each as (read, write) ends.
+    Pipes {
+        stdin: (OwnedFd, OwnedFd),
+        stdout: (OwnedFd, OwnedFd),
+        stderr: (OwnedFd, OwnedFd),
+    },
+}
+
 fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::Result<()> {
     // Writing a start frame to a client allows us to bluck until the client
     // arrives. Otherwise any attempt to read from a serial device that has no connected
     // clients will fail with an error and we would need to spin.
     let start_frame = Frame::new(FrameType::Start, vec![]);
     start_frame.write_to(&mut client_channel).unwrap();
-    let mut channel_writer = client_channel.try_clone()?;
+    let channel_writer = Arc::new(Mutex::new(client_channel.try_clone()?));
     let mut client_channel_reader = FrameReader::new(client_channel);
 
-    let (pty_master, pty_slave, _) = open_pty()?;
-
     // The client opens with a start reply telling whether it stands for a
-    // real terminal. When it does not (stdin is piped), input must not be
-    // echoed back into the output. A client that starts directly with a
-    // resize gets full terminal semantics by default.
+    // real terminal. When it does, the command runs behind a PTY; when it
+    // does not (stdin is piped), the command gets plain pipes instead.
     let start_reply_frame = client_channel_reader
         .next()
         .expect("channel closed before start reply")?;
@@ -103,17 +119,26 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
             start_reply_frame
         );
     };
-    if !tty_allocate {
-        disable_echo(&pty_slave)?;
-    }
 
+    // The initial terminal size always follows; without a tty it is ignored.
     let resize_frame = client_channel_reader
         .next()
         .expect("channel closed before initial resize")?;
     let Some((cols, rows)) = resize_frame.as_resize() else {
         panic!("Unexpected frame: {:?}", resize_frame.frame_type);
     };
-    set_winsize(pty_master.as_raw_fd(), cols, rows);
+
+    let stdio = if tty_allocate {
+        let (master, slave, _) = open_pty()?;
+        set_winsize(master.as_raw_fd(), cols, rows);
+        Stdio::Tty { master, slave }
+    } else {
+        Stdio::Pipes {
+            stdin: pipe()?,
+            stdout: pipe()?,
+            stderr: pipe()?,
+        }
+    };
 
     // Build exec arguments and environment before forking so the child does
     // no allocation between fork() and execvpe() beyond the pointer arrays.
@@ -143,26 +168,73 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
         None => None,
     };
 
+    let status = match stdio {
+        Stdio::Tty { master, slave } => run_with_tty(
+            client_channel_reader,
+            &channel_writer,
+            master,
+            slave,
+            &argv,
+            &envp,
+            new_root_c.as_deref(),
+        ),
+        Stdio::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        } => run_with_pipes(
+            client_channel_reader,
+            &channel_writer,
+            stdin,
+            stdout,
+            stderr,
+            &argv,
+            &envp,
+            new_root_c.as_deref(),
+        ),
+    };
+
+    // Move devpts back even if pumping or waiting failed, so the old root
+    // is left the way we found it.
+    if let Some(target) = &devpts_target
+        && let Err(e) = move_mount(target, Path::new("/dev/pts"))
+    {
+        eprintln!("server: unable to move devpts back: {e}");
+    }
+
+    send_frame(&channel_writer, &Frame::exit(exit_code(status?)))
+}
+
+/// Fork the command behind the given PTY and pump its I/O until it exits.
+/// Returns the raw `waitpid` status.
+fn run_with_tty(
+    reader: FrameReader<File>,
+    channel: &Arc<Mutex<File>>,
+    pty_master: OwnedFd,
+    pty_slave: OwnedFd,
+    argv: &[CString],
+    envp: &[CString],
+    new_root: Option<&CStr>,
+) -> io::Result<libc::c_int> {
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
-        // Child
         drop(pty_master);
-        drop(client_channel_reader);
-        exec_shell(
-            pty_slave.as_raw_fd(),
-            &argv[0],
-            &argv,
-            &envp,
-            new_root_c.as_deref(),
+        drop(reader);
+        exec_child(
+            ChildStdio::Tty {
+                slave: pty_slave.as_raw_fd(),
+            },
+            argv,
+            envp,
+            new_root,
         );
-        // exec_shell never returns.
+        // exec_child never returns.
     } else {
-        // Parent: hand the slave end and the pipe's write end to the child only.
+        // Parent: the slave end travels with the child only.
         drop(pty_slave);
-
         let pty_master = File::from(pty_master);
 
         // Channel -> child: decode frames, drive the PTY.
@@ -170,25 +242,82 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
             let pty_master = pty_master.try_clone()?;
             thread::Builder::new()
                 .name("pump_client_frames".into())
-                .spawn(move || pump_client_frames(client_channel_reader, pty_master))
+                .spawn(move || pump_client_frames(reader, pty_master))
                 .expect("Unable to spawn thread");
         }
 
-        // PTY master -> channel as stdout frames.
-        let pump_result = pump_stdout(pty_master, &mut channel_writer);
+        // PTY master -> channel as stdout frames (stderr shares the PTY).
+        let pump_result = pump_output(pty_master, FrameType::Stdout, channel);
         let status = wait_for(child);
-
-        // Move devpts back even if pumping or waiting failed, so the old root
-        // is left the way we found it.
-        if let Some(target) = &devpts_target
-            && let Err(e) = move_mount(target, Path::new("/dev/pts"))
-        {
-            eprintln!("server: unable to move devpts back: {e}");
-        }
         pump_result?;
+        status
+    }
+}
 
-        Frame::exit(exit_code(status?)).write_to(&mut channel_writer)?;
-        Ok(())
+/// Fork the command with plain pipes for stdin/stdout/stderr and pump its
+/// I/O until it exits. Returns the raw `waitpid` status.
+#[allow(clippy::too_many_arguments)]
+fn run_with_pipes(
+    reader: FrameReader<File>,
+    channel: &Arc<Mutex<File>>,
+    (stdin_read, stdin_write): (OwnedFd, OwnedFd),
+    (stdout_read, stdout_write): (OwnedFd, OwnedFd),
+    (stderr_read, stderr_write): (OwnedFd, OwnedFd),
+    argv: &[CString],
+    envp: &[CString],
+    new_root: Option<&CStr>,
+) -> io::Result<libc::c_int> {
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        // Close the parent's ends so the command sees EOF on stdin when the
+        // parent drops its write end, and the parent sees EOF on stdout and
+        // stderr when the command exits.
+        drop(stdin_write);
+        drop(stdout_read);
+        drop(stderr_read);
+        drop(reader);
+        exec_child(
+            ChildStdio::Pipes {
+                stdin: stdin_read.as_raw_fd(),
+                stdout: stdout_write.as_raw_fd(),
+                stderr: stderr_write.as_raw_fd(),
+            },
+            argv,
+            envp,
+            new_root,
+        );
+        // exec_child never returns.
+    } else {
+        // Parent: the child's ends travel with the child only.
+        drop(stdin_read);
+        drop(stdout_write);
+        drop(stderr_write);
+
+        // Channel -> child stdin.
+        thread::Builder::new()
+            .name("pump_client_frames".into())
+            .spawn(move || pump_client_frames_to_pipe(reader, File::from(stdin_write)))
+            .expect("Unable to spawn thread");
+
+        // Child stderr -> channel as stderr frames, concurrently with stdout.
+        let stderr_pump = {
+            let channel = Arc::clone(channel);
+            thread::Builder::new()
+                .name("pump_stderr".into())
+                .spawn(move || pump_output(File::from(stderr_read), FrameType::Stderr, &channel))
+                .expect("Unable to spawn thread")
+        };
+
+        // Child stdout -> channel as stdout frames.
+        let stdout_result = pump_output(File::from(stdout_read), FrameType::Stdout, channel);
+        let stderr_result = stderr_pump.join().expect("stderr pump panicked");
+        let status = wait_for(child);
+        stdout_result?;
+        stderr_result?;
+        status
     }
 }
 
@@ -231,15 +360,40 @@ fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> i
     Ok(())
 }
 
-/// Read bytes from `src`, chunk them into frames on `endpoint`, and write each
-/// whole frame to the shared channel under the lock so frames never interleave.
-fn pump_stdout(mut src: impl Read, sink: &mut File) -> io::Result<()> {
+/// Decode frames from the channel and feed stdin bytes to the command's
+/// stdin pipe. An empty stdin frame (the client's stdin reached EOF) closes
+/// the write end so the command sees EOF. Resize frames are ignored: there
+/// is no terminal to resize.
+fn pump_client_frames_to_pipe(reader: FrameReader<impl Read>, stdin_pipe: File) -> io::Result<()> {
+    let mut stdin_pipe = Some(stdin_pipe);
+    for item in reader {
+        let frame = item?;
+        if frame.frame_type == FrameType::Stdin {
+            if frame.payload.is_empty() {
+                stdin_pipe = None;
+            } else if let Some(pipe) = stdin_pipe.as_mut() {
+                pipe.write_all(&frame.payload)?;
+                pipe.flush()?;
+            }
+        } else if frame.as_resize().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unexpected frame type: {:?}", frame.frame_type),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read bytes from `src` and forward them to the channel as frames of the
+/// given type.
+fn pump_output(mut src: impl Read, frame_type: FrameType, channel: &Mutex<File>) -> io::Result<()> {
     let mut buf = [0u8; MAX_PAYLOAD];
 
     loop {
         match src.read(&mut buf) {
             Ok(0) => break Ok(()),
-            Ok(n) => Frame::new(FrameType::Stdout, buf[..n].to_vec()).write_to(sink)?,
+            Ok(n) => send_frame(channel, &Frame::new(frame_type, buf[..n].to_vec()))?,
             // On Unix systems when child process drops slave part of pty, read doesn't return EOF,
             // it generate EIO error instead.
             // Unfortunatley this error code is not stabilized by Rust, so we need to use `Errno` here.
@@ -250,37 +404,72 @@ fn pump_stdout(mut src: impl Read, sink: &mut File) -> io::Result<()> {
     }
 }
 
+/// Write a whole frame to the shared channel under the lock so frames from
+/// concurrent pumps never interleave.
+fn send_frame(channel: &Mutex<File>, frame: &Frame) -> io::Result<()> {
+    let mut w = channel
+        .lock()
+        .map_err(|_| io::Error::other("channel lock poisoned"))?;
+    frame.write_to(&mut *w)
+}
+
+/// The command's stdin/stdout/stderr targets, as raw fds for the child half
+/// of fork/exec.
+enum ChildStdio {
+    /// A PTY slave, made the controlling terminal and shared by all three.
+    Tty { slave: RawFd },
+    /// A plain pipe end per stream.
+    Pipes {
+        stdin: RawFd,
+        stdout: RawFd,
+        stderr: RawFd,
+    },
+}
+
 /// Child half of fork/exec. Replaces the process image; never returns.
 ///
 /// Only async-signal-safe libc calls are used here. The process is
 /// single-threaded at this point (threads are spawned after the fork).
-fn exec_shell(
-    slave_fd: RawFd,
-    prog: &CString,
-    argv: &[CString],
-    envp: &[CString],
-    new_root: Option<&CStr>,
-) -> ! {
+fn exec_child(stdio: ChildStdio, argv: &[CString], envp: &[CString], new_root: Option<&CStr>) -> ! {
     unsafe {
-        if libc::setsid() < 0 {
-            libc::_exit(127);
-        }
-        // Make the PTY slave the controlling terminal.
-        if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
-            libc::_exit(127);
-        }
-        libc::dup2(slave_fd, libc::STDIN_FILENO);
-        libc::dup2(slave_fd, libc::STDOUT_FILENO);
-        libc::dup2(slave_fd, libc::STDERR_FILENO);
+        match stdio {
+            ChildStdio::Tty { slave } => {
+                if libc::setsid() < 0 {
+                    libc::_exit(127);
+                }
+                // Make the PTY slave the controlling terminal.
+                if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
+                    libc::_exit(127);
+                }
+                libc::dup2(slave, libc::STDIN_FILENO);
+                libc::dup2(slave, libc::STDOUT_FILENO);
+                libc::dup2(slave, libc::STDERR_FILENO);
 
-        if slave_fd > libc::STDERR_FILENO {
-            libc::close(slave_fd);
-        }
-
-        if let Some(root) = new_root {
-            if libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0 {
-                libc::_exit(127);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
             }
+            ChildStdio::Pipes {
+                stdin,
+                stdout,
+                stderr,
+            } => {
+                libc::dup2(stdin, libc::STDIN_FILENO);
+                libc::dup2(stdout, libc::STDOUT_FILENO);
+                libc::dup2(stderr, libc::STDERR_FILENO);
+
+                for fd in [stdin, stdout, stderr] {
+                    if fd > libc::STDERR_FILENO {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+
+        if let Some(root) = new_root
+            && (libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0)
+        {
+            libc::_exit(127);
         }
 
         let argv_ptrs: Vec<*const c_char> = argv
@@ -294,7 +483,7 @@ fn exec_shell(
             .chain(once(ptr::null()))
             .collect();
 
-        libc::execve(prog.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
         // Only reached if exec failed.
         libc::_exit(127);
     }
@@ -373,6 +562,15 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd, PathBuf)> {
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
     Ok((master, slave, PathBuf::from(pty_name)))
+}
+
+/// `pipe(2)` wrapper returning owned (read, write) fds.
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Apply a terminal size to a PTY via `TIOCSWINSZ`.

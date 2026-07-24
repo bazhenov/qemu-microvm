@@ -18,8 +18,6 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Output},
-    thread,
-    time::Duration,
 };
 use tempdir::TempDir;
 
@@ -143,11 +141,6 @@ fn run_in_vm(data_dir: &Path, disks: &[&Path], stdin_value: Option<&str>, cmd: &
     drop(stdin);
 
     wait_with_timeout(child, "qemu")
-}
-
-#[test]
-fn test_foo() {
-    thread::sleep(Duration::from_secs(2));
 }
 
 /// Create an empty (sparse) raw disk image of the given size in bytes.

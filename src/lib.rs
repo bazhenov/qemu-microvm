@@ -48,7 +48,7 @@ pub enum FrameType {
     Exit = 6,
     /// client's reply to [`FrameType::Start`]: `tty_allocate:u8` flag
     /// (listener: server). When the flag is 0 the client's stdin is not a
-    /// terminal and the shell's PTY should not behave like one (no echo).
+    /// terminal and the command runs on plain pipes instead of a PTY.
     StartReply = 7,
 }
 
@@ -277,21 +277,6 @@ impl<R: Read> Iterator for FrameReader<R> {
 pub fn configure_raw_pty(tty: &impl AsFd) -> io::Result<()> {
     let mut tio = termios::tcgetattr(tty)?;
     termios::cfmakeraw(&mut tio);
-    termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
-    Ok(())
-}
-
-/// Disable echo on a PTY, keeping canonical mode (and the rest of the line
-/// discipline) intact.
-///
-/// The line discipline echoes everything written to the master back to it:
-/// the command's output gets polluted with a copy of its input (plus control
-/// characters like the VEOF `^D`), which piped input is not supposed to
-/// produce. Programs that draw their own input line (readline shells like
-/// bash) are unaffected.
-pub fn disable_echo(tty: &impl AsFd) -> io::Result<()> {
-    let mut tio = termios::tcgetattr(tty)?;
-    tio.local_flags.remove(termios::LocalFlags::ECHO);
     termios::tcsetattr(tty, termios::SetArg::TCSANOW, &tio)?;
     Ok(())
 }
