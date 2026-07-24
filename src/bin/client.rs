@@ -237,8 +237,8 @@ impl Drop for RawGuard {
 }
 
 /// Bridge the local terminal to the server over the framed channel at `path`.
-fn run(path: &Path) -> io::Result<Option<i32>> {
-    let channel = File::options().read(true).write(true).open(path)?;
+fn run(serial_path: &Path) -> io::Result<Option<i32>> {
+    let channel = File::options().read(true).write(true).open(serial_path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;
     let mut reader = FrameReader::new(reader_file);

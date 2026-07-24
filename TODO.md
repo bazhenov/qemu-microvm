@@ -1,6 +1,6 @@
 ## In progress
 
-- [ ] using stdin
+- [ ] tests on redirecting to stderr
 - [ ] provide a way to build rootfs
 
 ## Backlog
@@ -9,6 +9,10 @@
 - [ ] add logging
 - [ ] exiting failing with `pump_to_channel() = I/O error (os error 5)`
 - [ ] add options to specify kernel and path to block device
+
+# Jul 24
+
+- [x] using stdin
 
 # Jul 16
 

@@ -168,14 +168,25 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
         None => None,
     };
 
+    let argv_ptrs: Vec<*const c_char> = argv
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(once(ptr::null()))
+        .collect();
+    let envp_ptrs: Vec<*const c_char> = envp
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain(once(ptr::null()))
+        .collect();
+
     let status = match stdio {
         Stdio::Tty { master, slave } => run_with_tty(
             client_channel_reader,
             &channel_writer,
             master,
             slave,
-            &argv,
-            &envp,
+            &argv_ptrs,
+            &envp_ptrs,
             new_root_c.as_deref(),
         ),
         Stdio::Pipes {
@@ -188,8 +199,8 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
             stdin,
             stdout,
             stderr,
-            &argv,
-            &envp,
+            &argv_ptrs,
+            &envp_ptrs,
             new_root_c.as_deref(),
         ),
     };
@@ -212,25 +223,29 @@ fn run_with_tty(
     channel: &Arc<Mutex<File>>,
     pty_master: OwnedFd,
     pty_slave: OwnedFd,
-    argv: &[CString],
-    envp: &[CString],
+    argv: &[*const c_char],
+    envp: &[*const c_char],
     new_root: Option<&CStr>,
 ) -> io::Result<libc::c_int> {
     let child = unsafe { libc::fork() };
+    // NOTE: There must be no allocations or any ther async-signal-unsafe calls
+    // past this point in the children
     if child < 0 {
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
         drop(pty_master);
         drop(reader);
-        exec_child(
-            ChildStdio::Tty {
-                slave: pty_slave.as_raw_fd(),
-            },
-            argv,
-            envp,
-            new_root,
-        );
+
+        unsafe {
+            // Creating process group and make the PTY slave the controlling terminal.
+            if libc::setsid() < 0 || libc::ioctl(pty_slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) < 0
+            {
+                libc::_exit(127);
+            }
+        }
+
+        exec_child(&pty_slave, &pty_slave, &pty_slave, argv, envp, new_root);
         // exec_child never returns.
     } else {
         // Parent: the slave end travels with the child only.
@@ -263,8 +278,8 @@ fn run_with_pipes(
     (stdin_read, stdin_write): (OwnedFd, OwnedFd),
     (stdout_read, stdout_write): (OwnedFd, OwnedFd),
     (stderr_read, stderr_write): (OwnedFd, OwnedFd),
-    argv: &[CString],
-    envp: &[CString],
+    argv: &[*const c_char],
+    envp: &[*const c_char],
     new_root: Option<&CStr>,
 ) -> io::Result<libc::c_int> {
     let child = unsafe { libc::fork() };
@@ -280,11 +295,9 @@ fn run_with_pipes(
         drop(stderr_read);
         drop(reader);
         exec_child(
-            ChildStdio::Pipes {
-                stdin: stdin_read.as_raw_fd(),
-                stdout: stdout_write.as_raw_fd(),
-                stderr: stderr_write.as_raw_fd(),
-            },
+            &stdin_read,
+            &stdout_write,
+            &stderr_write,
             argv,
             envp,
             new_root,
@@ -413,56 +426,29 @@ fn send_frame(channel: &Mutex<File>, frame: &Frame) -> io::Result<()> {
     frame.write_to(&mut *w)
 }
 
-/// The command's stdin/stdout/stderr targets, as raw fds for the child half
-/// of fork/exec.
-enum ChildStdio {
-    /// A PTY slave, made the controlling terminal and shared by all three.
-    Tty { slave: RawFd },
-    /// A plain pipe end per stream.
-    Pipes {
-        stdin: RawFd,
-        stdout: RawFd,
-        stderr: RawFd,
-    },
-}
-
 /// Child half of fork/exec. Replaces the process image; never returns.
 ///
 /// Only async-signal-safe libc calls are used here. The process is
 /// single-threaded at this point (threads are spawned after the fork).
-fn exec_child(stdio: ChildStdio, argv: &[CString], envp: &[CString], new_root: Option<&CStr>) -> ! {
+fn exec_child(
+    stdin: &impl AsRawFd,
+    stdout: &impl AsRawFd,
+    stderr: &impl AsRawFd,
+    argv: &[*const c_char],
+    envp: &[*const c_char],
+    new_root: Option<&CStr>,
+) -> ! {
+    let stdin = stdin.as_raw_fd();
+    let stdout = stdout.as_raw_fd();
+    let stderr = stderr.as_raw_fd();
     unsafe {
-        match stdio {
-            ChildStdio::Tty { slave } => {
-                if libc::setsid() < 0 {
-                    libc::_exit(127);
-                }
-                // Make the PTY slave the controlling terminal.
-                if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
-                    libc::_exit(127);
-                }
-                libc::dup2(slave, libc::STDIN_FILENO);
-                libc::dup2(slave, libc::STDOUT_FILENO);
-                libc::dup2(slave, libc::STDERR_FILENO);
+        libc::dup2(stdin, libc::STDIN_FILENO);
+        libc::dup2(stdout, libc::STDOUT_FILENO);
+        libc::dup2(stderr, libc::STDERR_FILENO);
 
-                if slave > libc::STDERR_FILENO {
-                    libc::close(slave);
-                }
-            }
-            ChildStdio::Pipes {
-                stdin,
-                stdout,
-                stderr,
-            } => {
-                libc::dup2(stdin, libc::STDIN_FILENO);
-                libc::dup2(stdout, libc::STDOUT_FILENO);
-                libc::dup2(stderr, libc::STDERR_FILENO);
-
-                for fd in [stdin, stdout, stderr] {
-                    if fd > libc::STDERR_FILENO {
-                        libc::close(fd);
-                    }
-                }
+        for fd in [stdin, stdout, stderr] {
+            if fd > libc::STDERR_FILENO {
+                libc::close(fd);
             }
         }
 
@@ -472,18 +458,7 @@ fn exec_child(stdio: ChildStdio, argv: &[CString], envp: &[CString], new_root: O
             libc::_exit(127);
         }
 
-        let argv_ptrs: Vec<*const c_char> = argv
-            .iter()
-            .map(|c| c.as_ptr())
-            .chain(once(ptr::null()))
-            .collect();
-        let envp_ptrs: Vec<*const c_char> = envp
-            .iter()
-            .map(|c| c.as_ptr())
-            .chain(once(ptr::null()))
-            .collect();
-
-        libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
         // Only reached if exec failed.
         libc::_exit(127);
     }
