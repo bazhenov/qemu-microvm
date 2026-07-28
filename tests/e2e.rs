@@ -100,6 +100,16 @@ fn additional_disk_in_vm() {
     .assert_stdout_contains("8192");
 }
 
+#[test]
+fn propagate_exit_status() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    let out = run_in_vm(&data_dir, &[], None, &["/bin/false"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
 /// `client` command with the project root as the working directory, so the
 /// default `--root-fs rootfs.qcow2` and the kernel/initrd paths resolve.
 fn client() -> Command {
@@ -122,16 +132,16 @@ fn init_env(data_dir: &Path) {
 /// Run `cmd` in a VM booted from the `data_dir` environment and return its
 /// output.
 fn run_in_vm(data_dir: &Path, disks: &[&Path], stdin_value: Option<&str>, cmd: &[&str]) -> Output {
-    let mut command = client();
-    command
+    let mut client_cmd = client();
+    client_cmd
         .arg("run")
         .arg("--emulate")
         .arg("--data-dir")
         .arg(data_dir);
     for disk in disks {
-        command.arg("--disk").arg(disk);
+        client_cmd.arg("--disk").arg(disk);
     }
-    let mut child = command.arg("--").args(cmd).spawn().unwrap();
+    let mut child = client_cmd.arg("--").args(cmd).spawn().unwrap();
 
     let mut stdin = child.stdin.take().unwrap();
     if let Some(stdin_value) = stdin_value {
