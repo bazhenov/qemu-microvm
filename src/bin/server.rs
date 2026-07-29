@@ -9,24 +9,25 @@
 //! - no terminal (the client's stdin is piped): the command gets three plain
 //!   pipes, bytes pass through byte-exact and stderr rides its own endpoint.
 //!
-//! Threaded, blocking I/O. The channel device path is the sole argument.
+//! The command runs in an SSH-like session:
+//!
+//!  - the user is resolved from the passwd database of the target root via `getpwuid(3)`
+//!  - the environment (HOME, USER, LOGNAME, SHELL, PATH, TERM) is built fresh from that entry
+//!    instead of being inherited
+//!  - when no command is given the user's shell is run as a login shell
 
 use clap::Parser;
 use libc::c_char;
 use nix::errno::Errno;
 use qemu_agent::{Frame, FrameReader, FrameType, MAX_PAYLOAD, configure_raw_pty};
 use std::{
-    env,
     ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     iter::once,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{
-            self,
-            ffi::{OsStrExt, OsStringExt},
-        },
+        unix::{self, ffi::OsStrExt},
     },
     path::{Path, PathBuf},
     process::ExitCode,
@@ -44,10 +45,9 @@ struct Args {
     /// path to the serial device for communicating with the host
     pub serial: Option<PathBuf>,
     #[arg(long)]
-    /// chroot into this directory before executing the command. The PTY is
-    /// allocated first, then /dev/pts is move-mounted to <DIR>/dev/pts and
-    /// moved back once the command exits. Linux only.
+    /// chroot into this directory before executing the command
     pub chroot: Option<PathBuf>,
+    /// command to execute; when empty the user's shell is run as a login shell
     pub command: Vec<String>,
 }
 
@@ -141,18 +141,25 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
     };
 
     // Build exec arguments and environment before forking so the child does
-    // no allocation between fork() and execvpe() beyond the pointer arrays.
-    let argv = cmd
-        .iter()
-        .copied()
-        .map(str::as_bytes)
-        .map(CString::new)
-        .collect::<Result<Vec<_>, _>>()?;
-    let envp = build_env();
+    // no allocation between fork() and execve()
+    let user = lookup_user(new_root)?;
+    let env_path = CString::new(DEFAULT_PATH)?;
+    let env = build_env(&user, DEFAULT_PATH);
+    let home = CString::new(user.home.as_bytes())?;
 
-    let new_root_c = new_root
-        .map(|p| CString::new(p.as_os_str().as_bytes()))
-        .transpose()?;
+    let (path, argv) = if cmd.is_empty() {
+        let path = CString::new(user.shell.as_bytes())?;
+        let argv0 = CString::new(login_arg0(&user.shell))?;
+        (path, vec![argv0])
+    } else {
+        let argv = cmd
+            .iter()
+            .copied()
+            .map(str::as_bytes)
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        (argv[0].clone(), argv)
+    };
 
     // Usually mount points are moved to a new rootfs by an init process, /dev/pts is an exception, because
     // it can not be moved before server started. Server spawns a new pty, so it needs /dev/pts
@@ -168,40 +175,72 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
         None => None,
     };
 
+    let new_root_c = new_root
+        .map(|p| CString::new(p.as_os_str().as_bytes()))
+        .transpose()?;
+
     let argv_ptrs: Vec<*const c_char> = argv
         .iter()
         .map(|c| c.as_ptr())
         .chain(once(ptr::null()))
         .collect();
-    let envp_ptrs: Vec<*const c_char> = envp
+    let envp_ptrs: Vec<*const c_char> = env
         .iter()
         .map(|c| c.as_ptr())
         .chain(once(ptr::null()))
         .collect();
 
+    let exec_args = ExecArgs {
+        path: &path,
+        argv: &argv_ptrs,
+        env: &envp_ptrs,
+        env_path: env_path.as_c_str(),
+        home: &home,
+    };
+
+    let child = unsafe { libc::fork() };
+    // NOTE: There must be no allocations or any ther async-signal-unsafe calls
+    // past this point in the children
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if child == 0 {
+        // Making chroot in a child
+        unsafe {
+            if let Some(root) = new_root_c.as_deref()
+                && (libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0)
+            {
+                libc::_exit(127);
+            }
+
+            // Start in the user's home directory the way login(1)/sshd do; when
+            // it does not exist the cwd stays as is (/ after a chroot).
+            libc::chdir(exec_args.home.as_ptr());
+        }
+    }
+
     let status = match stdio {
         Stdio::Tty { master, slave } => run_with_tty(
+            child,
             client_channel_reader,
             &channel_writer,
             master,
             slave,
-            &argv_ptrs,
-            &envp_ptrs,
-            new_root_c.as_deref(),
+            &exec_args,
         ),
         Stdio::Pipes {
             stdin,
             stdout,
             stderr,
         } => run_with_pipes(
+            child,
             client_channel_reader,
             &channel_writer,
             stdin,
             stdout,
             stderr,
-            &argv_ptrs,
-            &envp_ptrs,
-            new_root_c.as_deref(),
+            &exec_args,
         ),
     };
 
@@ -216,24 +255,30 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
     send_frame(&channel_writer, &Frame::exit(exit_code(status?)))
 }
 
-/// Fork the command behind the given PTY and pump its I/O until it exits.
-/// Returns the raw `waitpid` status.
+/// Everything the forked child needs to become the command, prepared before
+/// fork so the child allocates nothing.
+struct ExecArgs<'a> {
+    /// Path passed to execve; argv[0] may differ (a login shell is "-bash").
+    path: &'a CStr,
+    /// NULL-terminated argv pointers.
+    argv: &'a [*const c_char],
+    /// NULL-terminated envp pointers.
+    env: &'a [*const c_char],
+    /// value of `PATH` env variable used to run initial process
+    env_path: &'a CStr,
+    /// The user's home directory: the command starts there
+    home: &'a CStr,
+}
+
 fn run_with_tty(
+    child_pid: i32,
     reader: FrameReader<File>,
     channel: &Arc<Mutex<File>>,
     pty_master: OwnedFd,
     pty_slave: OwnedFd,
-    argv: &[*const c_char],
-    envp: &[*const c_char],
-    new_root: Option<&CStr>,
+    exec_args: &ExecArgs,
 ) -> io::Result<libc::c_int> {
-    let child = unsafe { libc::fork() };
-    // NOTE: There must be no allocations or any ther async-signal-unsafe calls
-    // past this point in the children
-    if child < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if child == 0 {
+    if child_pid == 0 {
         drop(pty_master);
         drop(reader);
 
@@ -245,7 +290,7 @@ fn run_with_tty(
             }
         }
 
-        exec_child(&pty_slave, &pty_slave, &pty_slave, argv, envp, new_root);
+        exec_child(&pty_slave, &pty_slave, &pty_slave, exec_args);
         // exec_child never returns.
     } else {
         // Parent: the slave end travels with the child only.
@@ -257,13 +302,14 @@ fn run_with_tty(
             let pty_master = pty_master.try_clone()?;
             thread::Builder::new()
                 .name("pump_client_frames".into())
-                .spawn(move || pump_client_frames(reader, pty_master))
+                .spawn(move || pump_client_frames_tty(reader, pty_master))
                 .expect("Unable to spawn thread");
         }
 
         // PTY master -> channel as stdout frames (stderr shares the PTY).
         let pump_result = pump_output(pty_master, FrameType::Stdout, channel);
-        let status = wait_for(child);
+        // We must to reclaim a child no mater what the result was
+        let status = wait_for(child_pid);
         pump_result?;
         status
     }
@@ -271,22 +317,16 @@ fn run_with_tty(
 
 /// Fork the command with plain pipes for stdin/stdout/stderr and pump its
 /// I/O until it exits. Returns the raw `waitpid` status.
-#[allow(clippy::too_many_arguments)]
 fn run_with_pipes(
+    child_pid: i32,
     reader: FrameReader<File>,
     channel: &Arc<Mutex<File>>,
     (stdin_read, stdin_write): (OwnedFd, OwnedFd),
     (stdout_read, stdout_write): (OwnedFd, OwnedFd),
     (stderr_read, stderr_write): (OwnedFd, OwnedFd),
-    argv: &[*const c_char],
-    envp: &[*const c_char],
-    new_root: Option<&CStr>,
+    exec_args: &ExecArgs,
 ) -> io::Result<libc::c_int> {
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if child == 0 {
+    if child_pid == 0 {
         // Close the parent's ends so the command sees EOF on stdin when the
         // parent drops its write end, and the parent sees EOF on stdout and
         // stderr when the command exits.
@@ -294,14 +334,7 @@ fn run_with_pipes(
         drop(stdout_read);
         drop(stderr_read);
         drop(reader);
-        exec_child(
-            &stdin_read,
-            &stdout_write,
-            &stderr_write,
-            argv,
-            envp,
-            new_root,
-        );
+        exec_child(&stdin_read, &stdout_write, &stderr_write, exec_args);
         // exec_child never returns.
     } else {
         // Parent: the child's ends travel with the child only.
@@ -321,15 +354,15 @@ fn run_with_pipes(
             thread::Builder::new()
                 .name("pump_stderr".into())
                 .spawn(move || pump_output(File::from(stderr_read), FrameType::Stderr, &channel))
-                .expect("Unable to spawn \thread")
+                .expect("Unable to spawn thread")
         };
 
         // Child stdout -> channel as stdout frames.
         let stdout_result = pump_output(File::from(stdout_read), FrameType::Stdout, channel);
         let stderr_result = stderr_pump.join().expect("stderr pump panicked");
-        let status = wait_for(child);
-        stdout_result?;
-        stderr_result?;
+        // We must to reclaim a child no mater what the result was
+        let status = wait_for(child_pid);
+        stdout_result.and(stderr_result)?;
         status
     }
 }
@@ -338,7 +371,7 @@ fn run_with_pipes(
 const EOF_CHAR: u8 = 0x04;
 
 /// Decode frames from the channel and apply them to the PTY master.
-fn pump_client_frames(reader: FrameReader<impl Read>, mut pty_master: File) -> io::Result<()> {
+fn pump_client_frames_tty(reader: FrameReader<impl Read>, mut pty_master: File) -> io::Result<()> {
     // In canonical mode VEOF produces EOF (a zero-length read) only at the
     // start of a line; written mid-line it just flushes the partial line to
     // the reader. Track where we are to know how many VEOFs EOF takes.
@@ -426,9 +459,7 @@ fn exec_child(
     stdin: &impl AsRawFd,
     stdout: &impl AsRawFd,
     stderr: &impl AsRawFd,
-    argv: &[*const c_char],
-    envp: &[*const c_char],
-    new_root: Option<&CStr>,
+    exec_args: &ExecArgs,
 ) -> ! {
     let stdin = stdin.as_raw_fd();
     let stdout = stdout.as_raw_fd();
@@ -444,31 +475,153 @@ fn exec_child(
             }
         }
 
-        if let Some(root) = new_root
-            && (libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0)
-        {
-            libc::_exit(127);
-        }
+        // execvpe() reads PATH not from env given to it, but from parent environment
+        // so we need to set it here
+        libc::setenv("PATH".as_ptr() as _, exec_args.env_path.as_ptr() as _, 1);
 
-        libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+        #[cfg(target_os = "linux")]
+        {
+            libc::execvpe(
+                exec_args.path.as_ptr(),
+                exec_args.argv.as_ptr(),
+                exec_args.env.as_ptr(),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // This branch is needed for testing on non Linux platforms
+            // Behaviour should not be identical, but it should be saimilar enough to
+            // test server with an integration test
+            libc::execve(
+                exec_args.path.as_ptr(),
+                exec_args.argv.as_ptr(),
+                exec_args.env.as_ptr(),
+            );
+        }
         // Only reached if exec failed.
         libc::_exit(127);
     }
 }
 
-/// Current environment with `TERM` forced to `xterm-256color`.
-fn build_env() -> Vec<CString> {
-    let mut env: Vec<CString> = env::vars_os()
-        .filter(|(k, _)| k != "TERM")
-        .filter_map(|(k, v)| {
-            let mut entry = k.into_vec();
-            entry.push(b'=');
-            entry.extend_from_slice(v.as_bytes());
-            CString::new(entry).ok()
-        })
-        .collect();
-    env.push(CString::new("TERM=xterm-256color").unwrap());
-    env
+/// Default PATH for sessions (see `man 1 login`)
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin";
+
+/// The pieces of a passwd entry needed to set up a session.
+struct User {
+    name: String,
+    home: String,
+    shell: String,
+}
+
+/// Defaults for environments with no passwd database at all (e.g. the
+/// initramfs in recovery mode).
+impl Default for User {
+    fn default() -> Self {
+        Self {
+            name: "root".to_string(),
+            home: "/".to_string(),
+            shell: "/bin/sh".to_string(),
+        }
+    }
+}
+
+impl User {
+    fn create(name: String, home: String, shell: String) -> Self {
+        let defaults = Self::default();
+        User {
+            name: if name.is_empty() { defaults.name } else { name },
+            home: if home.is_empty() { defaults.home } else { home },
+            shell: if shell.is_empty() {
+                defaults.shell
+            } else {
+                shell
+            },
+        }
+    }
+}
+
+/// Resolve the current uid through `getpwuid(3)`, the way login(1)/sshd pick
+/// up the user's shell and home directory from /etc/passwd.
+///
+/// getpwuid() always reads the passwd database of the process root, while
+/// the entry of interest lives inside `new_root` when chrooting. So the
+/// lookup temporarily chroots there and escapes back through saved
+/// descriptors of the old root and cwd (the server runs as root in the VM,
+/// so it is allowed to). Must be called before any threads are spawned that
+/// depend on the filesystem.
+fn lookup_user(new_root: Option<&Path>) -> io::Result<User> {
+    let Some(root) = new_root else {
+        return Ok(read_current_user());
+    };
+
+    let old_root = File::open("/")?;
+    let old_cwd = File::open(".")?;
+    let root = CString::new(root.as_os_str().as_bytes())?;
+    if unsafe { libc::chroot(root.as_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let user = read_current_user();
+    // Failing to escape would leave the whole server running in the wrong
+    // root, so it is fatal.
+    let escaped = unsafe {
+        libc::fchdir(old_root.as_raw_fd()) >= 0
+            && libc::chroot(c".".as_ptr()) >= 0
+            && libc::fchdir(old_cwd.as_raw_fd()) >= 0
+    };
+    if !escaped {
+        return Err(io::Error::other(format!(
+            "unable to escape chroot: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(user)
+}
+
+/// Read the current uid's passwd entry, falling back to root defaults when
+/// there is none. Empty fields fall back individually (an empty shell in
+/// passwd conventionally means /bin/sh).
+fn read_current_user() -> User {
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() {
+        return User::default();
+    }
+    unsafe {
+        User::create(
+            c_str_to_string((*pw).pw_name),
+            c_str_to_string((*pw).pw_dir),
+            c_str_to_string((*pw).pw_shell),
+        )
+    }
+}
+
+unsafe fn c_str_to_string(ptr: *const c_char) -> String {
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Convention all shell interpreters should follow is that if argv[0]
+/// starts with "-" (eg. `-bash`) it means this is login shell (eg. `bash -l`)
+fn login_arg0(shell: &str) -> String {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    format!("-{name}")
+}
+
+/// A fresh SSH-like session environment built from the user's passwd entry;
+/// nothing is inherited from the server's own environment.
+fn build_env(user: &User, path: &str) -> Vec<CString> {
+    [
+        format!("HOME={}", user.home),
+        format!("USER={}", user.name),
+        format!("LOGNAME={}", user.name),
+        format!("SHELL={}", user.shell),
+        format!("PATH={path}"),
+        "TERM=xterm-256color".to_string(),
+    ]
+    .into_iter()
+    // Passwd fields come from C strings, so no interior NULs are possible
+    .map(|entry| CString::new(entry).expect("NUL byte in session environment"))
+    .collect()
 }
 
 /// Move a mounted filesystem onto a new mountpoint (`mount -o move`),
@@ -578,6 +731,21 @@ fn exit_code(status: libc::c_int) -> i32 {
 mod tests {
     use super::*;
     use rand::{Rng, RngExt, make_rng, rngs::SmallRng};
+
+    #[test]
+    fn login_arg0_uses_shell_basename() {
+        assert_eq!(login_arg0("/bin/bash"), "-bash");
+        assert_eq!(login_arg0("/usr/bin/zsh"), "-zsh");
+        assert_eq!(login_arg0("sh"), "-sh");
+    }
+
+    #[test]
+    fn current_user_always_resolves() {
+        let user = read_current_user();
+        assert!(!user.name.is_empty());
+        assert!(!user.home.is_empty());
+        assert!(!user.shell.is_empty());
+    }
 
     #[test]
     fn openpty_mirroring() {

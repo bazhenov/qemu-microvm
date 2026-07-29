@@ -24,17 +24,11 @@ hostname sandbox
 
 if grep -qw "init_recovery" /proc/cmdline; then
     # The number of host-tty device depends on the order of arguments passed to QEMU
-    # Just in case if we meess things up listing all vport devices in recovery mode
+    # Just in case if we mess things up listing all vport devices in recovery mode
     echo "Serial devices:"
     ls /dev/vport*
     exec /bin/server --serial /dev/vport0p1 /bin/sh
 else
-    # The kernel passes everything after "--" on its command line to init
-    # as arguments; use them as the starting command if present.
-    if [ $# -eq 0 ]; then
-        set -- /usr/bin/login -f root
-    fi
-
     mkdir -p /mnt
     mount /dev/vda /mnt
 
@@ -60,10 +54,10 @@ else
 
     # From now on we do not care about exit code. We stee need to move on
     set +e
-    # The server allocates its PTY first, then move-mounts /dev/pts to
-    # /mnt/dev/pts, chroots the command into /mnt and moves the mount back
-    # once the command exits.
-    /usr/bin/env -i TERM=xterm-color /bin/server --serial /dev/vport0p1 --chroot /mnt -- "$@"
+
+    # The kernel passes everything after "--" on its command line to init as
+    # arguments; they are the command to run
+    /bin/server --serial /dev/vport0p1 --chroot /mnt -- "$@"
 
     # Moving system mounts back
     # Filesystems should be unmounted in the opposite order

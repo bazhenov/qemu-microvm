@@ -100,6 +100,38 @@ fn additional_disk_in_vm() {
     .assert_stdout_contains("8192");
 }
 
+/// The server builds the session environment itself (SSH-like): identity
+/// from the rootfs /etc/passwd, default PATH, and the command starts in the
+/// user's home directory.
+#[test]
+fn session_environment() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    run_in_vm(
+        &data_dir,
+        &[],
+        None,
+        &["/bin/sh", "-c", "echo $USER,$HOME,$PATH; pwd"],
+    )
+    .assert_success()
+    .assert_stdout_contains("root,/root,/usr/local/sbin:")
+    .assert_stdout_contains("\n/root\n");
+}
+
+#[test]
+fn should_respect_default_path_in_noninteractive_mode() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    // Running env (not /usr/bin/env) to check if PATH env variable is respected
+    run_in_vm(&data_dir, &[], None, &["env"])
+        .assert_success()
+        .assert_stdout_contains("USER=root");
+}
+
 #[test]
 fn propagate_exit_status() {
     let tmp = TempDir::new("vm-env").unwrap();
