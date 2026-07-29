@@ -98,7 +98,7 @@ enum Stdio {
 }
 
 fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::Result<()> {
-    // Writing a start frame to a client allows us to bluck until the client
+    // Writing a start frame to a client allows us to block until the client
     // arrives. Otherwise any attempt to read from a serial device that has no connected
     // clients will fail with an error and we would need to spin.
     let start_frame = Frame::new(FrameType::Start, vec![]);
@@ -140,27 +140,6 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
         }
     };
 
-    // Build exec arguments and environment before forking so the child does
-    // no allocation between fork() and execve()
-    let user = lookup_user(new_root)?;
-    let env_path = CString::new(DEFAULT_PATH)?;
-    let env = build_env(&user, DEFAULT_PATH);
-    let home = CString::new(user.home.as_bytes())?;
-
-    let (path, argv) = if cmd.is_empty() {
-        let path = CString::new(user.shell.as_bytes())?;
-        let argv0 = CString::new(login_arg0(&user.shell))?;
-        (path, vec![argv0])
-    } else {
-        let argv = cmd
-            .iter()
-            .copied()
-            .map(str::as_bytes)
-            .map(CString::new)
-            .collect::<Result<Vec<_>, _>>()?;
-        (argv[0].clone(), argv)
-    };
-
     // Usually mount points are moved to a new rootfs by an init process, /dev/pts is an exception, because
     // it can not be moved before server started. Server spawns a new pty, so it needs /dev/pts
     // in place when it started, but new spawned process (in a rootfs context) probably also needs
@@ -179,192 +158,183 @@ fn run(mut client_channel: File, cmd: &[&str], new_root: Option<&Path>) -> io::R
         .map(|p| CString::new(p.as_os_str().as_bytes()))
         .transpose()?;
 
-    let argv_ptrs: Vec<*const c_char> = argv
-        .iter()
-        .map(|c| c.as_ptr())
-        .chain(once(ptr::null()))
-        .collect();
-    let envp_ptrs: Vec<*const c_char> = env
-        .iter()
-        .map(|c| c.as_ptr())
-        .chain(once(ptr::null()))
-        .collect();
-
-    let exec_args = ExecArgs {
-        path: &path,
-        argv: &argv_ptrs,
-        env: &envp_ptrs,
-        env_path: env_path.as_c_str(),
-        home: &home,
-    };
-
-    let child = unsafe { libc::fork() };
+    let child_pid = unsafe { libc::fork() };
     // NOTE: There must be no allocations or any ther async-signal-unsafe calls
     // past this point in the children
-    if child < 0 {
+    if child_pid < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    if child == 0 {
-        // Making chroot in a child
+    if child_pid == 0 {
+        // Child
+        drop(client_channel_reader);
+
+        // Making chroot in a child into target FS root
         unsafe {
             if let Some(root) = new_root_c.as_deref()
                 && (libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0)
             {
                 libc::_exit(127);
             }
-
-            // Start in the user's home directory the way login(1)/sshd do; when
-            // it does not exist the cwd stays as is (/ after a chroot).
-            libc::chdir(exec_args.home.as_ptr());
         }
+
+        // Reading current user, his shell and homedir.
+        // It can only be done after we chroot'ed into target root fs.
+        let user = read_current_user().unwrap_or_default();
+        let env_path = CString::new(DEFAULT_PATH)?;
+        let env = build_env(&user, DEFAULT_PATH);
+
+        let (path, argv) = if cmd.is_empty() {
+            let path = CString::new(user.shell.as_bytes())?;
+            let argv0 = CString::new(login_arg0(&user.shell))?;
+            (path, vec![argv0])
+        } else {
+            let argv = cmd
+                .iter()
+                .copied()
+                .map(str::as_bytes)
+                .map(CString::new)
+                .collect::<Result<Vec<_>, _>>()?;
+            (argv[0].clone(), argv)
+        };
+
+        let exec_args = ExecArgs {
+            path,
+            argv: argv
+                .iter()
+                .map(|c| c.as_ptr())
+                .chain(once(ptr::null()))
+                .collect(),
+            env: env
+                .iter()
+                .map(|c| c.as_ptr())
+                .chain(once(ptr::null()))
+                .collect(),
+            env_path,
+        };
+
+        // Start in the user's home directory the way login(1)/sshd do; when
+        // it does not exist the cwd stays as is (/ after a chroot).
+        {
+            let home = CString::new(user.home.as_bytes())?;
+            unsafe {
+                libc::chdir(home.as_ptr());
+            }
+        }
+
+        match stdio {
+            Stdio::Tty { master, slave } => {
+                drop(master);
+
+                unsafe {
+                    // Creating process group and make the PTY slave the controlling terminal.
+                    if libc::setsid() < 0
+                        || libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) < 0
+                    {
+                        libc::_exit(127);
+                    }
+                }
+
+                exec_child(&slave, &slave, &slave, exec_args);
+            }
+            Stdio::Pipes {
+                stdin: (stdin_read, stdin_write),
+                stdout: (stdout_read, stdout_write),
+                stderr: (stderr_read, stderr_write),
+            } => {
+                // Close the parent's ends so the command sees EOF on stdin when the
+                // parent drops its write end, and the parent sees EOF on stdout and
+                // stderr when the command exits.
+                drop(stdin_write);
+                drop(stdout_read);
+                drop(stderr_read);
+                exec_child(&stdin_read, &stdout_write, &stderr_write, exec_args);
+            }
+        }
+    } else {
+        // Parent
+        let result = match stdio {
+            Stdio::Tty { master, slave } => {
+                drop(slave);
+                let pty_master = File::from(master);
+
+                // Channel -> child: decode frames, drive the PTY.
+                {
+                    let pty_master = pty_master.try_clone()?;
+                    thread::Builder::new()
+                        .name("pump_client_frames".into())
+                        .spawn(move || pump_client_frames_tty(client_channel_reader, pty_master))
+                        .expect("Unable to spawn thread");
+                }
+
+                // PTY master -> channel as stdout frames (stderr shares the PTY).
+                pump_output(pty_master, FrameType::Stdout, &channel_writer)
+            }
+            Stdio::Pipes {
+                stdin: (stdin_read, stdin_write),
+                stdout: (stdout_read, stdout_write),
+                stderr: (stderr_read, stderr_write),
+            } => {
+                // Parent: the child's ends travel with the child only.
+                drop(stdin_read);
+                drop(stdout_write);
+                drop(stderr_write);
+
+                // Channel -> child stdin.
+                thread::Builder::new()
+                    .name("pump_client_frames".into())
+                    .spawn(move || {
+                        pump_client_frames_to_pipe(client_channel_reader, File::from(stdin_write))
+                    })
+                    .expect("Unable to spawn thread");
+
+                // Child stderr -> channel as stderr frames, concurrently with stdout.
+                let stderr_pump = {
+                    let channel = Arc::clone(&channel_writer);
+                    thread::Builder::new()
+                        .name("pump_stderr".into())
+                        .spawn(move || {
+                            pump_output(File::from(stderr_read), FrameType::Stderr, &channel)
+                        })
+                        .expect("Unable to spawn thread")
+                };
+
+                // Child stdout -> channel as stdout frames.
+                let stdout_result =
+                    pump_output(File::from(stdout_read), FrameType::Stdout, &channel_writer);
+                let stderr_result = stderr_pump.join().expect("stderr pump panicked");
+                stdout_result.and(stderr_result)
+            }
+        };
+
+        // We must to reclaim a child no mater what the result was,
+        // but we intentionally do not unwrap Result here, so that subsequent steps (move mounts)
+        // will still be executed
+        let status: Result<_, _> = result.and(wait_for(child_pid));
+
+        // Move devpts back even if pumping or waiting failed, so the old root
+        // is left the way we found it.
+        if let Some(target) = &devpts_target
+            && let Err(e) = move_mount(target, Path::new("/dev/pts"))
+        {
+            eprintln!("server: unable to move devpts back: {e}");
+        }
+
+        send_frame(&channel_writer, &Frame::exit(exit_code(status?)))
     }
-
-    let status = match stdio {
-        Stdio::Tty { master, slave } => run_with_tty(
-            child,
-            client_channel_reader,
-            &channel_writer,
-            master,
-            slave,
-            &exec_args,
-        ),
-        Stdio::Pipes {
-            stdin,
-            stdout,
-            stderr,
-        } => run_with_pipes(
-            child,
-            client_channel_reader,
-            &channel_writer,
-            stdin,
-            stdout,
-            stderr,
-            &exec_args,
-        ),
-    };
-
-    // Move devpts back even if pumping or waiting failed, so the old root
-    // is left the way we found it.
-    if let Some(target) = &devpts_target
-        && let Err(e) = move_mount(target, Path::new("/dev/pts"))
-    {
-        eprintln!("server: unable to move devpts back: {e}");
-    }
-
-    send_frame(&channel_writer, &Frame::exit(exit_code(status?)))
 }
 
 /// Everything the forked child needs to become the command, prepared before
 /// fork so the child allocates nothing.
-struct ExecArgs<'a> {
+struct ExecArgs {
     /// Path passed to execve; argv[0] may differ (a login shell is "-bash").
-    path: &'a CStr,
+    path: CString,
     /// NULL-terminated argv pointers.
-    argv: &'a [*const c_char],
+    argv: Vec<*const c_char>,
     /// NULL-terminated envp pointers.
-    env: &'a [*const c_char],
+    env: Vec<*const c_char>,
     /// value of `PATH` env variable used to run initial process
-    env_path: &'a CStr,
-    /// The user's home directory: the command starts there
-    home: &'a CStr,
-}
-
-fn run_with_tty(
-    child_pid: i32,
-    reader: FrameReader<File>,
-    channel: &Arc<Mutex<File>>,
-    pty_master: OwnedFd,
-    pty_slave: OwnedFd,
-    exec_args: &ExecArgs,
-) -> io::Result<libc::c_int> {
-    if child_pid == 0 {
-        drop(pty_master);
-        drop(reader);
-
-        unsafe {
-            // Creating process group and make the PTY slave the controlling terminal.
-            if libc::setsid() < 0 || libc::ioctl(pty_slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) < 0
-            {
-                libc::_exit(127);
-            }
-        }
-
-        exec_child(&pty_slave, &pty_slave, &pty_slave, exec_args);
-        // exec_child never returns.
-    } else {
-        // Parent: the slave end travels with the child only.
-        drop(pty_slave);
-        let pty_master = File::from(pty_master);
-
-        // Channel -> child: decode frames, drive the PTY.
-        {
-            let pty_master = pty_master.try_clone()?;
-            thread::Builder::new()
-                .name("pump_client_frames".into())
-                .spawn(move || pump_client_frames_tty(reader, pty_master))
-                .expect("Unable to spawn thread");
-        }
-
-        // PTY master -> channel as stdout frames (stderr shares the PTY).
-        let pump_result = pump_output(pty_master, FrameType::Stdout, channel);
-        // We must to reclaim a child no mater what the result was
-        let status = wait_for(child_pid);
-        pump_result?;
-        status
-    }
-}
-
-/// Fork the command with plain pipes for stdin/stdout/stderr and pump its
-/// I/O until it exits. Returns the raw `waitpid` status.
-fn run_with_pipes(
-    child_pid: i32,
-    reader: FrameReader<File>,
-    channel: &Arc<Mutex<File>>,
-    (stdin_read, stdin_write): (OwnedFd, OwnedFd),
-    (stdout_read, stdout_write): (OwnedFd, OwnedFd),
-    (stderr_read, stderr_write): (OwnedFd, OwnedFd),
-    exec_args: &ExecArgs,
-) -> io::Result<libc::c_int> {
-    if child_pid == 0 {
-        // Close the parent's ends so the command sees EOF on stdin when the
-        // parent drops its write end, and the parent sees EOF on stdout and
-        // stderr when the command exits.
-        drop(stdin_write);
-        drop(stdout_read);
-        drop(stderr_read);
-        drop(reader);
-        exec_child(&stdin_read, &stdout_write, &stderr_write, exec_args);
-        // exec_child never returns.
-    } else {
-        // Parent: the child's ends travel with the child only.
-        drop(stdin_read);
-        drop(stdout_write);
-        drop(stderr_write);
-
-        // Channel -> child stdin.
-        thread::Builder::new()
-            .name("pump_client_frames".into())
-            .spawn(move || pump_client_frames_to_pipe(reader, File::from(stdin_write)))
-            .expect("Unable to spawn thread");
-
-        // Child stderr -> channel as stderr frames, concurrently with stdout.
-        let stderr_pump = {
-            let channel = Arc::clone(channel);
-            thread::Builder::new()
-                .name("pump_stderr".into())
-                .spawn(move || pump_output(File::from(stderr_read), FrameType::Stderr, &channel))
-                .expect("Unable to spawn thread")
-        };
-
-        // Child stdout -> channel as stdout frames.
-        let stdout_result = pump_output(File::from(stdout_read), FrameType::Stdout, channel);
-        let stderr_result = stderr_pump.join().expect("stderr pump panicked");
-        // We must to reclaim a child no mater what the result was
-        let status = wait_for(child_pid);
-        stdout_result.and(stderr_result)?;
-        status
-    }
+    env_path: CString,
 }
 
 /// The default `VEOF` control character (`Ctrl-D`).
@@ -451,15 +421,14 @@ fn send_frame(channel: &Mutex<File>, frame: &Frame) -> io::Result<()> {
     frame.write_to(&mut *w)
 }
 
-/// Child half of fork/exec. Replaces the process image; never returns.
+/// Child half of fork/exec.
 ///
-/// Only async-signal-safe libc calls are used here. The process is
-/// single-threaded at this point (threads are spawned after the fork).
+/// Sets given handles as stdin/stdout/stderr of executing process
 fn exec_child(
     stdin: &impl AsRawFd,
     stdout: &impl AsRawFd,
     stderr: &impl AsRawFd,
-    exec_args: &ExecArgs,
+    exec_args: ExecArgs,
 ) -> ! {
     let stdin = stdin.as_raw_fd();
     let stdout = stdout.as_raw_fd();
@@ -540,68 +509,35 @@ impl User {
     }
 }
 
-/// Resolve the current uid through `getpwuid(3)`, the way login(1)/sshd pick
-/// up the user's shell and home directory from /etc/passwd.
-///
-/// getpwuid() always reads the passwd database of the process root, while
-/// the entry of interest lives inside `new_root` when chrooting. So the
-/// lookup temporarily chroots there and escapes back through saved
-/// descriptors of the old root and cwd (the server runs as root in the VM,
-/// so it is allowed to). Must be called before any threads are spawned that
-/// depend on the filesystem.
-fn lookup_user(new_root: Option<&Path>) -> io::Result<User> {
-    let Some(root) = new_root else {
-        return Ok(read_current_user());
-    };
-
-    let old_root = File::open("/")?;
-    let old_cwd = File::open(".")?;
-    let root = CString::new(root.as_os_str().as_bytes())?;
-    if unsafe { libc::chroot(root.as_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let user = read_current_user();
-    // Failing to escape would leave the whole server running in the wrong
-    // root, so it is fatal.
-    let escaped = unsafe {
-        libc::fchdir(old_root.as_raw_fd()) >= 0
-            && libc::chroot(c".".as_ptr()) >= 0
-            && libc::fchdir(old_cwd.as_raw_fd()) >= 0
-    };
-    if !escaped {
-        return Err(io::Error::other(format!(
-            "unable to escape chroot: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    Ok(user)
-}
-
 /// Read the current uid's passwd entry, falling back to root defaults when
-/// there is none. Empty fields fall back individually (an empty shell in
-/// passwd conventionally means /bin/sh).
-fn read_current_user() -> User {
+/// there is none.
+fn read_current_user() -> Option<User> {
+    fn from_c_str(ptr: *const c_char) -> String {
+        if ptr.is_null() {
+            "".to_string()
+        } else {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
     let pw = unsafe { libc::getpwuid(libc::getuid()) };
     if pw.is_null() {
-        return User::default();
+        None
+    } else {
+        unsafe {
+            Some(User::create(
+                from_c_str((*pw).pw_name),
+                from_c_str((*pw).pw_dir),
+                from_c_str((*pw).pw_shell),
+            ))
+        }
     }
-    unsafe {
-        User::create(
-            c_str_to_string((*pw).pw_name),
-            c_str_to_string((*pw).pw_dir),
-            c_str_to_string((*pw).pw_shell),
-        )
-    }
-}
-
-unsafe fn c_str_to_string(ptr: *const c_char) -> String {
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Convention all shell interpreters should follow is that if argv[0]
-/// starts with "-" (eg. `-bash`) it means this is login shell (eg. `bash -l`)
+/// starts with "-" (eg. `-bash`) it means this it is a login shell (eg. `bash -l`)
 fn login_arg0(shell: &str) -> String {
     let name = shell.rsplit('/').next().unwrap_or(shell);
     format!("-{name}")
@@ -741,7 +677,7 @@ mod tests {
 
     #[test]
     fn current_user_always_resolves() {
-        let user = read_current_user();
+        let user = read_current_user().unwrap();
         assert!(!user.name.is_empty());
         assert!(!user.home.is_empty());
         assert!(!user.shell.is_empty());
