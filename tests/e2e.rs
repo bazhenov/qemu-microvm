@@ -58,6 +58,24 @@ fn init_and_run() {
     .assert_stdout_match("running in sandbox\n");
 }
 
+/// `run --root-fs` boots the given image directly, without a data directory.
+#[test]
+fn run_with_explicit_root_fs() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    let child = client()
+        .args(["run", "--emulate", "--root-fs"])
+        .arg(data_dir.join("rootfs.qcow2"))
+        .args(["--", "/bin/sh", "-c", "echo running in $(hostname)"])
+        .spawn()
+        .unwrap();
+    wait_with_timeout(child, "qemu")
+        .assert_success()
+        .assert_stdout_match("running in sandbox\n");
+}
+
 #[test]
 fn md5sum_in_vm() {
     let tmp = TempDir::new("vm-env").unwrap();

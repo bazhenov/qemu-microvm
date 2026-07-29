@@ -1,13 +1,19 @@
 //! Client side of the serial multiplexer (Unix).
 //!
-//! Two subcommands:
+//! Subcommands:
 //!
 //! - `init` — set up a new VM environment: clone the root filesystem image
 //!   into the data directory (`./.vm` by default).
-//! - `run` — boot a VM from an initialized data directory, put the local
-//!   terminal in raw mode and bridge it to the server over the framed channel:
-//!   keystrokes ride endpoint 0, the shell's stdout/stderr come back on
-//!   endpoints 1/2, and SIGWINCH is forwarded as resize frames.
+//! - `run-vm` — boot a VM from a root filesystem image (`--root-fs`): a
+//!   glorified QEMU wrapper that runs in the foreground until the VM shuts
+//!   down and exposes the guest server over a serial pty (`--serial`).
+//! - `shell` — attach the local terminal to a running VM's serial pty: put
+//!   the terminal in raw mode and bridge it to the server over the framed
+//!   channel: keystrokes ride endpoint 0, the shell's stdout/stderr come back
+//!   on endpoints 1/2, and SIGWINCH is forwarded as resize frames.
+//! - `run` — the two above combined: spawn `run-vm` and `shell` as child
+//!   processes and report the shell's exit code (the code of the command that
+//!   ran in the guest).
 //!
 //! Threaded, blocking I/O. `Ctrl-]` then `q` disconnects locally.
 
@@ -18,10 +24,11 @@ use qemu_agent::{
 };
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
+    env,
     fs::{self, File},
     io::{self, IsTerminal, Read, Write, stdin},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, ExitStatus, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
@@ -45,8 +52,12 @@ struct Cli {
 enum Cmd {
     /// Initialize a new VM environment in the data directory
     Init(InitArgs),
-    /// Run a VM from an already initialized data directory
+    /// Run a VM from an already initialized data directory and attach a shell to it
     Run(RunArgs),
+    /// Boot a VM under QEMU from a root filesystem image
+    RunVm(RunVmArgs),
+    /// Attach the local terminal to a running VM over its serial pty
+    Shell(ShellArgs),
 }
 
 #[derive(Args, Debug)]
@@ -64,8 +75,13 @@ struct InitArgs {
 #[derive(Args, Debug)]
 struct RunArgs {
     /// VM data directory previously initialized with `init`
-    #[arg(long = "data-dir", value_name = "dir", default_value = DEFAULT_DATA_DIR)]
+    #[arg(long = "data-dir", value_name = "dir", default_value = DEFAULT_DATA_DIR, conflicts_with = "root_fs")]
     data_dir: PathBuf,
+
+    /// Root filesystem disk image booted directly (read-write) instead of
+    /// the rootfs from an initialized data directory
+    #[arg(long = "root-fs", value_name = "disk")]
+    root_fs: Option<PathBuf>,
 
     /// If specified no VM will be launched automatically. Instead client will connect to a given pty
     #[arg(long = "serial", value_name = "path")]
@@ -94,10 +110,53 @@ struct RunArgs {
     command: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct RunVmArgs {
+    /// Root filesystem disk image booted read-write as /dev/vda
+    /// (format inferred from the extension: .qcow2 — qcow2, anything else — raw)
+    #[arg(long = "root-fs", value_name = "disk")]
+    root_fs: PathBuf,
+
+    /// Path where the serial pty connected to the VM-server is created
+    #[arg(long = "serial", value_name = "path")]
+    serial: PathBuf,
+
+    /// Dump VM boot logs to the stdout
+    #[arg(long = "boot-log")]
+    dump_boot_log: bool,
+
+    /// Run VM init in a recovery mode
+    #[arg(long = "recovery")]
+    recovery: bool,
+
+    /// Run in emulation mode (without using hypervisor)
+    #[arg(long = "emulate")]
+    emulate: bool,
+
+    /// Attach an additional disk image to the VM (may be given multiple times).
+    /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
+    #[arg(long = "disk", name = "disk")]
+    additional_disks: Vec<PathBuf>,
+
+    /// Command to run in the VM instead of the default login shell
+    /// (e.g. `client run-vm --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
+    #[arg(last = true, name = "command")]
+    command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct ShellArgs {
+    /// Serial pty of a running VM (created by `run-vm --serial`)
+    #[arg(long = "serial", value_name = "path")]
+    serial: PathBuf,
+}
+
 fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Init(args) => init_cmd(args),
         Cmd::Run(args) => run_cmd(args),
+        Cmd::RunVm(args) => run_vm_cmd(args),
+        Cmd::Shell(args) => shell_cmd(args),
     }
 }
 
@@ -156,51 +215,134 @@ fn find_root_fs(data_dir: &Path) -> Option<PathBuf> {
 }
 
 fn run_cmd(args: RunArgs) -> ExitCode {
-    let (path, join_handle) = if let Some(path) = args.serial {
-        (path, None)
-    } else {
-        let Some(root_fs) = find_root_fs(&args.data_dir) else {
-            eprintln!(
-                "run: VM environment is not initialized in {}, run `client init` first",
-                args.data_dir.display()
-            );
-            return ExitCode::FAILURE;
-        };
-        // Private temporary VM directory to hold intermediate VM artifacts
-        let private_dir = TempDir::new("vm").unwrap();
-        let serial_path = private_dir.path().join("vm-server");
-        let opts = VmLaunchOpts {
-            dump_boot_log: args.dump_boot_log,
-            serial_path: serial_path.clone(),
-            recovery: args.recovery,
-            root_fs,
-            emulate: args.emulate,
-            command: args.command,
-            additional_disks: args.additional_disks,
-        };
-        let handle = thread::spawn(move || {
-            let result = qemu::launch_vm(opts);
-            // We want to drop private dir only after VM has finished
-            drop(private_dir);
-            result
-        });
-        // Waiting util VM has started
-        while !fs::exists(&serial_path).unwrap() && !handle.is_finished() {
-            thread::sleep(Duration::from_millis(50));
+    match run_env(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("run: {e}");
+            ExitCode::FAILURE
         }
-        if handle.is_finished() {
-            // VM failed, returning error
-            eprintln!("vm: {:?}", handle.join().unwrap());
-            return ExitCode::FAILURE;
-        }
-        (serial_path, Some(handle))
+    }
+}
+
+/// Orchestrate a full VM session out of the two other subcommands, each in
+/// its own child process: `run-vm` boots QEMU with the serial pty in a
+/// private temp directory, `shell` bridges the local terminal to it. The
+/// shell's exit code (the code of the command that ran in the guest) becomes
+/// our own.
+fn run_env(args: RunArgs) -> io::Result<ExitCode> {
+    let client_exe = env::current_exe()?;
+
+    // With an explicit serial path there is no VM to launch, only the shell.
+    if let Some(serial) = args.serial {
+        let status = spawn_shell(&client_exe, &serial)?;
+        return Ok(propagate_status(status));
+    }
+
+    // An explicit rootfs image wins over the data directory (the two options
+    // are mutually exclusive on the command line).
+    let root_fs = match args.root_fs {
+        Some(root_fs) => root_fs,
+        None => match find_root_fs(&args.data_dir) {
+            Some(root_fs) => root_fs,
+            None => {
+                eprintln!(
+                    "run: VM environment is not initialized in {}, run `client init` first",
+                    args.data_dir.display()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+        },
     };
 
-    let result = run(&path);
-    if let Some(handle) = join_handle {
-        let _ = handle.join();
+    // Private temporary VM directory to hold intermediate VM artifacts;
+    // dropped (removed) only after the VM has finished.
+    let private_dir = TempDir::new("vm")?;
+    let serial_path = private_dir.path().join("vm-server");
+
+    let mut vm_cmd = Command::new(&client_exe);
+    vm_cmd
+        .arg("run-vm")
+        .arg("--root-fs")
+        .arg(&root_fs)
+        .arg("--serial")
+        .arg(&serial_path)
+        // The VM never reads our stdin, it belongs to the shell.
+        .stdin(Stdio::null());
+    if args.dump_boot_log {
+        vm_cmd.arg("--boot-log");
     }
-    match result {
+    if args.recovery {
+        vm_cmd.arg("--recovery");
+    }
+    if args.emulate {
+        vm_cmd.arg("--emulate");
+    }
+    for disk in &args.additional_disks {
+        vm_cmd.arg("--disk").arg(disk);
+    }
+    if !args.command.is_empty() {
+        vm_cmd.arg("--").args(&args.command);
+    }
+    let mut vm = vm_cmd.spawn()?;
+
+    // Waiting until VM has started (the serial pty shows up)
+    while !fs::exists(&serial_path)? {
+        if vm.try_wait()?.is_some() {
+            // VM failed before exposing the serial pty; its own stderr
+            // (inherited) already explains why.
+            return Ok(ExitCode::FAILURE);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let shell_status = Command::new(client_exe)
+        .arg("shell")
+        .arg("--serial")
+        .arg(serial_path)
+        .status()?;
+    let _ = vm.wait();
+    Ok(propagate_status(shell_status))
+}
+
+/// Run `client shell --serial <serial>` with inherited stdio and wait for it.
+fn spawn_shell(client_exe: &Path, serial: &Path) -> io::Result<ExitStatus> {
+    Command::new(client_exe)
+        .arg("shell")
+        .arg("--serial")
+        .arg(serial)
+        .status()
+}
+
+/// Turn a child's exit status into our own exit code (killed by a signal
+/// counts as failure).
+fn propagate_status(status: ExitStatus) -> ExitCode {
+    match status.code() {
+        Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
+        None => ExitCode::FAILURE,
+    }
+}
+
+fn run_vm_cmd(args: RunVmArgs) -> ExitCode {
+    let opts = VmLaunchOpts {
+        dump_boot_log: args.dump_boot_log,
+        serial_path: args.serial,
+        recovery: args.recovery,
+        root_fs: args.root_fs,
+        emulate: args.emulate,
+        command: args.command,
+        additional_disks: args.additional_disks,
+    };
+    match qemu::launch_vm(opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("run-vm: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn shell_cmd(args: ShellArgs) -> ExitCode {
+    match shell(&args.serial) {
         // Exit code reported by the VM process; absent when the session ended
         // without one (local escape, channel EOF).
         Ok(Some(code)) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
@@ -237,7 +379,7 @@ impl Drop for RawGuard {
 }
 
 /// Bridge the local terminal to the server over the framed channel at `path`.
-fn run(serial_path: &Path) -> io::Result<Option<i32>> {
+fn shell(serial_path: &Path) -> io::Result<Option<i32>> {
     let channel = File::options().read(true).write(true).open(serial_path)?;
     configure_raw_pty(&channel).unwrap();
     let reader_file = channel.try_clone()?;

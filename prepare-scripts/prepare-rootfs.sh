@@ -5,6 +5,8 @@ DISK="/dev/vdb"
 DISK_MOUNT="/rootfs"
 DOCKER_IMAGE="$1"
 
+echo "Preparing rootfs from Docker image: $DOCKER_IMAGE"
+
 mkfs.ext4 "$DISK"
 
 mkdir -p $DISK_MOUNT

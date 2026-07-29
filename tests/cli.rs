@@ -28,7 +28,41 @@ fn redirecting_stdin() {
         .assert_stdout_contains("31ebdfce8b77ac49d7f5506dd1495830");
 }
 
+/// `--data-dir` and `--root-fs` are two mutually exclusive ways to point
+/// `run` at a root filesystem.
+#[test]
+fn run_rejects_data_dir_with_root_fs() {
+    command(CLIENT)
+        .args(["run", "--data-dir", "vm", "--root-fs", "rootfs.qcow2"])
+        .output()
+        .unwrap()
+        .assert_failure()
+        .assert_stderr_contains("cannot be used with");
+}
+
+/// `shell` attaches to the tty directly, without the `run` orchestration.
+#[test]
+fn shell_subcommand() {
+    run_tty_test_via(
+        &["shell", "--serial", "./tty"],
+        &["/bin/bash", "-c", "echo Hi | md5sum"],
+        None,
+    )
+    .assert_success()
+    .assert_stdout_contains("31ebdfce8b77ac49d7f5506dd1495830");
+}
+
 fn run_tty_test(args: &[impl AsRef<OsStr>], stdin_value: Option<&str>) -> Output {
+    run_tty_test_via(&["run", "--serial", "./tty"], args, stdin_value)
+}
+
+/// Spawn the server on a tty in a temp directory and connect the client to it
+/// with the given client arguments.
+fn run_tty_test_via(
+    client_args: &[&str],
+    args: &[impl AsRef<OsStr>],
+    stdin_value: Option<&str>,
+) -> Output {
     let tmp_dir = TempDir::new("example").unwrap();
     let path = tmp_dir.path().to_path_buf();
 
@@ -48,7 +82,7 @@ fn run_tty_test(args: &[impl AsRef<OsStr>], stdin_value: Option<&str>) -> Output
     wait_for_path(tmp_dir.path().join("tty"));
 
     let mut child = command(CLIENT)
-        .args(["run", "--serial", "./tty"])
+        .args(client_args)
         .current_dir(tmp_dir.path())
         .spawn()
         .unwrap();

@@ -4,13 +4,20 @@ Rust project (`qemu-agent` crate) that runs commands inside a QEMU microVM. Two 
 `server` (runs inside/alongside the VM, executes commands) and `client` (boots the VM via
 `qemu-system-aarch64` and talks to the server over a serial console).
 
-The client has two subcommands:
+The client has four subcommands:
 
 - `client init` — initialize a new VM environment: clone the source root filesystem
   image (`--root-fs`, default `rootfs.qcow2`) into the data directory (`--data-dir`,
   default `./.vm`).
-- `client run` — boot a VM from an already initialized data directory (`--data-dir`,
-  default `./.vm`) and run a command in the guest.
+- `client run-vm` — boot a VM under QEMU from a root filesystem image (`--root-fs`,
+  booted read-write), exposing the guest server over a serial pty (`--serial`). Runs
+  in the foreground until the VM shuts down.
+- `client shell` — attach the local terminal to a running VM over its serial pty
+  (`--serial`) and proxy stdin/stdout/stderr/resize.
+- `client run` — the two above combined: spawn `run-vm` and `shell` as child
+  processes and report the guest command's exit code. Boots the rootfs from an
+  initialized data directory (`--data-dir`, default `./.vm`) or a given image
+  directly (`--root-fs`); the two options are mutually exclusive.
 
 ## Running tests
 
