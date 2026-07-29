@@ -404,7 +404,7 @@ fn pump_output(mut src: impl Read, frame_type: FrameType, channel: &Mutex<File>)
             Ok(n) => send_frame(channel, &Frame::new(frame_type, buf[..n].to_vec()))?,
             // On Unix systems when child process drops slave part of pty, read doesn't return EOF,
             // it generate EIO error instead.
-            // Unfortunatley this error code is not stabilized by Rust, so we need to use `Errno` here.
+            // Unfortunatley this error code is not stabilized by Rust yet, so we need to use `Errno` here.
             // see: https://unix.stackexchange.com/questions/538198/why-blocking-read-on-a-pty-returns-when-process-on-the-other-end-dies
             Err(_) if Errno::last() == Errno::EIO => break Ok(()),
             Err(e) => break Err(e),
