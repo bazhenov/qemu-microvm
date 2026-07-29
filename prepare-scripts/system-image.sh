@@ -11,8 +11,8 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt update -y
 
-# Installing all dependencies for a podman
-apt install -y podman
+# Installing all dependencies for a podman and all the tools required to prepare rootfs
+apt install -y podman rsync
 
 # Installing rust
 apt install -y curl
