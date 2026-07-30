@@ -68,7 +68,7 @@ struct InitArgs {
 
     /// Source root filesystem disk image cloned into the data directory
     /// (format inferred from the extension: .qcow2 — qcow2, anything else — raw).
-    #[arg(long = "root-fs", value_name = "disk", default_value = "rootfs.qcow2")]
+    #[arg(long = "root-fs", value_name = "disk")]
     root_fs: PathBuf,
 }
 
@@ -177,9 +177,7 @@ fn init_cmd(args: InitArgs) -> ExitCode {
     }
 }
 
-/// Create the data directory and clone the source root filesystem image into
-/// it as `rootfs.qcow2` (for a `.qcow2` source) or `rootfs.raw` (anything
-/// else), mirroring how the disk format is inferred from the extension.
+/// Create the data directory and clone the source root filesystem image into it
 fn init_env(data_dir: &Path, src_root_fs: &Path) -> io::Result<PathBuf> {
     if !src_root_fs.exists() {
         return Err(io::Error::new(

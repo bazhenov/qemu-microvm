@@ -3,7 +3,7 @@
 //! server and reports its output and exit code back.
 //!
 //! Each test initializes a private VM environment with `client init` (which
-//! clones the base `rootfs.qcow2` into a temp data directory) and boots it
+//! clones the base `images/sysfs.qcow2` into a temp data directory) and boots it
 //! with `client run`.
 //!
 //! Uses `--emulate` (TCG instead of the platform hypervisor) so the test
@@ -160,20 +160,18 @@ fn propagate_exit_status() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-/// `client` command with the project root as the working directory, so the
-/// default `--root-fs rootfs.qcow2` and the kernel/initrd paths resolve.
 fn client() -> Command {
     let mut command = common::command(CLIENT);
     command.current_dir(PROJECT_ROOT);
     command
 }
 
-/// Initialize a VM environment in `data_dir` from the base `rootfs.qcow2`.
 fn init_env(data_dir: &Path) {
     client()
         .arg("init")
         .arg("--data-dir")
         .arg(data_dir)
+        .args(["--root-fs", "images/sysfs.qcow2"])
         .output()
         .unwrap()
         .assert_success();

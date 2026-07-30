@@ -7,8 +7,7 @@ Rust project (`qemu-agent` crate) that runs commands inside a QEMU microVM. Two 
 The client has four subcommands:
 
 - `client init` — initialize a new VM environment: clone the source root filesystem
-  image (`--root-fs`, default `rootfs.qcow2`) into the data directory (`--data-dir`,
-  default `./.vm`).
+  image (`--root-fs`) into the data directory (`--data-dir`, default `./.vm`).
 - `client run-vm` — boot a VM under QEMU from a root filesystem image (`--root-fs`,
   booted read-write), exposing the guest server over a serial pty (`--serial`). Runs
   in the foreground until the VM shuts down.
@@ -46,8 +45,8 @@ The suite has three layers, which can be run separately:
 
 - `qemu-system-aarch64` on `PATH`.
 - A compiled kernel at `./linux/arch/arm64/boot/Image`. Download/configure with `make` (see `Makefile`), then compile with `make -C linux -j$(nproc)` — kernel compilation must be done on Linux.
-- `./target/initrd.gz` — built by `./build-initrd.sh` (requires the `aarch64-unknown-linux-musl` Rust target and `cpio`).
-- `./rootfs.qcow2` — the base root filesystem image. Preparing it is the user's
+- `./target/initrd.gz` — built by `make ./target/initrd.gz` (requires the `aarch64-unknown-linux-musl` Rust target and `cpio`).
+- `./images/sysfs.qcow2` — the base root filesystem image. Preparing it is the user's
   responsibility; `client init` clones it into the data directory (`fs::copy`, which
   is an APFS `clonefile` on macOS and a plain copy elsewhere) and `client run` boots
   the clone directly (read-write, no overlay). Each e2e test initializes its own VM

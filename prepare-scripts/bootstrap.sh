@@ -16,29 +16,35 @@
 
 set -exo pipefail
 
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    EMULATE="--emulate"
+fi
+
 SYSFS_IMAGE=alpine
 SYSFS=images/sysfs.qcow2
 VMCTL=target/release/client
+ALPINE_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz
+
 cargo build --release
 
-# Build a sysfs image ($2) using an existing rootfs ($1) as the build environment.
-build_sysfs() {
-	local source_fs=$1
-	local target_fs=$2
+# Preparing rootfs from a OCI image
+qemu-img create -f qcow2 "$SYSFS" 1G
 
-    # Preparing rootfs from a OCI image
-	qemu-img create -f qcow2 "$target_fs" 1G
-	cat prepare-scripts/prepare-rootfs.sh | $VMCTL run --root-fs "$source_fs" --disk "$target_fs" -- sh -s "$SYSFS_IMAGE"
+# Installing Alpine minirootfs on the new image
+cat << EOF | $VMCTL run $EMULATE --recovery --root-fs "$SYSFS" -- sh -sexo pipefail
+# There is no DNS in recovery mode and there is no intent to support it fully, because
+# it might negatively impact resilence of the recovery mode. So we need to enable it in ad hoc manner
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
 
-    # Installing all required dependencies in sysfs
-	cat << EOF | $VMCTL run --root-fs "$target_fs" -- sh -s
+apk add e2fsprogs
+mkfs.ext4 /dev/vda
+mkdir -p /rootfs
+mount /dev/vda /rootfs
+
+wget -qO- https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz | gunzip | tar xf - -C /rootfs
+EOF
+
+# Installing all required dependencies in a sysfs
+cat << EOF | $VMCTL run $EMULATE --root-fs "$SYSFS" -- sh -sexo pipefail
 apk add e2fsprogs podman rsync
 EOF
-}
-
-# Build a candidate sysfs first, then use the candidate to build the final sysfs,
-# proving the new sysfs is able to build sysfs itself.
-build_sysfs "$SYSFS" target/sysfs-candidate.qcow2
-build_sysfs target/sysfs-candidate.qcow2 target/sysfs.qcow2
-rm ./target/sysfs-candidate.qcow2
-mv -f target/sysfs.qcow2 "$SYSFS"
