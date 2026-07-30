@@ -42,6 +42,7 @@ mkdir -p /rootfs
 mount /dev/vda /rootfs
 
 wget -qO- https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz | gunzip | tar xf - -C /rootfs
+sync
 EOF
 
 # Installing all required dependencies in a sysfs
