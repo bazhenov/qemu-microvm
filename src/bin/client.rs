@@ -99,6 +99,14 @@ struct RunArgs {
     #[arg(long = "emulate")]
     emulate: bool,
 
+    /// Amount of memory in VM in megabytes
+    #[arg(long = "memory", default_value_t = 512)]
+    memory_megs: u32,
+
+    /// Amount of memory in VM in megabytes
+    #[arg(long = "cores", default_value_t = 1)]
+    cores: u16,
+
     /// Attach an additional disk image to the VM (may be given multiple times).
     /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
     #[arg(long = "disk", name = "disk")]
@@ -137,6 +145,14 @@ struct RunVmArgs {
     /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
     #[arg(long = "disk", name = "disk")]
     additional_disks: Vec<PathBuf>,
+
+    /// Amount of memory in VM in megabytes
+    #[arg(long = "memory", default_value_t = 512)]
+    memory_megs: u32,
+
+    /// Amount of memory in VM in megabytes
+    #[arg(long = "cores", default_value_t = 1)]
+    cores: u16,
 
     /// Command to run in the VM instead of the default login shell
     /// (e.g. `client run-vm --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
@@ -264,6 +280,10 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         .arg(&root_fs)
         .arg("--serial")
         .arg(&serial_path)
+        .arg("--memory")
+        .arg(format!("{}", args.memory_megs))
+        .arg("--cores")
+        .arg(format!("{}", args.cores))
         // The VM never reads our stdin, it belongs to the shell.
         .stdin(Stdio::null());
     if args.dump_boot_log {
@@ -328,6 +348,8 @@ fn run_vm_cmd(args: RunVmArgs) -> ExitCode {
         root_fs: args.root_fs,
         emulate: args.emulate,
         command: args.command,
+        cores: args.cores,
+        memory_megs: args.memory_megs,
         additional_disks: args.additional_disks,
     };
     match qemu::launch_vm(opts) {

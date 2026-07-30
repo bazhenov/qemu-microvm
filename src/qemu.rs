@@ -20,6 +20,12 @@ pub struct VmLaunchOpts {
     /// Start init in recovery mode
     pub recovery: bool,
 
+    /// Number of cores
+    pub cores: u16,
+
+    /// The amount of memory in a VM in MB
+    pub memory_megs: u32,
+
     /// Root filesystem disk image attached as the first virtio-blk device
     /// (`/dev/vda`).
     ///
@@ -99,9 +105,14 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         // General settings.
         .args(["-nodefaults", "-no-user-config", "-nographic", "-no-reboot"])
         // CPU settings
-        .args(["-M", "virt", "-smp", "cpus=1,sockets=1,cores=1,threads=1"])
+        .args([
+            "-M",
+            "virt",
+            "-smp",
+            &format!("cpus=1,sockets=1,cores={},threads=1", opts.cores),
+        ])
         // Memory settings
-        .args(["-m", "1G"]);
+        .args(["-m", &format!("{}M", opts.memory_megs)]);
 
     // Additional disk drives (guest sees them as /dev/vdb, /dev/vdc, ...).
     for (idx, disk) in opts.additional_disks.iter().enumerate() {
