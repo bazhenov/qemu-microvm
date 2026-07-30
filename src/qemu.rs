@@ -76,7 +76,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         "rdinit=/init".to_string(),
     ];
     if opts.recovery {
-        kernel_opts.push("init_recovery".to_string());
+        kernel_opts.push("init_recovery=1".to_string());
     }
 
     if let Some(value) = format_init_args(&opts)? {
