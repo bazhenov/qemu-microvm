@@ -31,10 +31,10 @@ magic byte, and no resynchronization mechanism.
 | ----- | -------- | --------------------------------- | ---------- |
 | 1     | `Start`  | —                                 | —          |
 | 2     | `Stdin`  | raw bytes for the shell's stdin   | server     |
-| 3     | `Stdout` | raw bytes from the shell's stdout | client     |
-| 4     | `Stderr` | raw bytes from the shell's stderr | client     |
+| 3     | `Stdout` | raw bytes from the shell's stdout | vmctl      |
+| 4     | `Stderr` | raw bytes from the shell's stderr | vmctl      |
 | 5     | `Resize` | `cols:u16, rows:u16` (4 bytes)    | server     |
-| 6     | `Exit`   | `code:i32` (4 bytes)              | client     |
+| 6     | `Exit`   | `code:i32` (4 bytes)              | vmctl      |
 
 Any other type value decodes as `Unknown`. The frame is still read in full so
 the stream stays in sync; the receiver decides whether to drop it.
@@ -49,4 +49,4 @@ the stream stays in sync; the receiver decides whether to drop it.
 - `Exit` is the last frame the server sends: it is written only after the
   shell process has been reaped and all of its remaining output has been
   flushed to the channel. The code is the shell-style exit status (`128 +
-  signal` if the process was killed).
+signal` if the process was killed).

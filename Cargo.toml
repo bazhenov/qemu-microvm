@@ -12,8 +12,8 @@ name = "server"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "client"
-path = "src/bin/client.rs"
+name = "vmctl"
+path = "src/bin/vmctl.rs"
 
 [dependencies]
 thiserror = "2"

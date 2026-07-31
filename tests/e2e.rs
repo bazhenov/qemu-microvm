@@ -2,9 +2,9 @@
 //! (kernel + initrd + rootfs), runs a command in the guest through the
 //! server and reports its output and exit code back.
 //!
-//! Each test initializes a private VM environment with `client init` (which
+//! Each test initializes a private VM environment with `vmctl init` (which
 //! clones the base `images/sysfs.qcow2` into a temp data directory) and boots it
-//! with `client run`.
+//! with `vmctl run`.
 //!
 //! Uses `--emulate` (TCG instead of the platform hypervisor) so the test
 //! itself can run inside a VM. QEMU is launched with paths relative to the
@@ -21,7 +21,7 @@ use std::{
 };
 use tempdir::TempDir;
 
-const CLIENT: &str = env!("CARGO_BIN_EXE_client");
+const VMCTL: &str = env!("CARGO_BIN_EXE_vmctl");
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 #[test]
@@ -39,7 +39,7 @@ fn init_and_run() {
     assert!(data_dir.join("rootfs.qcow2").is_file());
 
     // repeated `init` on the same data directory must fail
-    client()
+    vmctl()
         .arg("init")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -65,7 +65,7 @@ fn run_with_explicit_root_fs() {
     let data_dir = tmp.path().join("vm");
     init_env(&data_dir);
 
-    let child = client()
+    let child = vmctl()
         .args(["run", "--emulate", "--root-fs"])
         .arg(data_dir.join("rootfs.qcow2"))
         .args(["--", "/bin/sh", "-c", "echo running in $(hostname)"])
@@ -88,7 +88,7 @@ fn run_with_explicit_root_fs() {
 #[test]
 fn boot_log_mention() {
     let tmp_dir = TempDir::new("vm-env").unwrap();
-    let child = client()
+    let child = vmctl()
         .current_dir(tmp_dir.path())
         .args([
             "run",
@@ -187,14 +187,14 @@ fn propagate_exit_status() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-fn client() -> Command {
-    let mut command = common::command(CLIENT);
+fn vmctl() -> Command {
+    let mut command = common::command(VMCTL);
     command.current_dir(PROJECT_ROOT);
     command
 }
 
 fn init_env(data_dir: &Path) {
-    client()
+    vmctl()
         .arg("init")
         .arg("--data-dir")
         .arg(data_dir)
@@ -207,22 +207,22 @@ fn init_env(data_dir: &Path) {
 /// Run `cmd` in a VM booted from the `data_dir` environment and return its
 /// output.
 fn run_in_vm(data_dir: &Path, disks: &[&Path], stdin_value: Option<&str>, cmd: &[&str]) -> Output {
-    let mut client_cmd = client();
-    client_cmd
+    let mut vmctl_cmd = vmctl();
+    vmctl_cmd
         .arg("run")
         .arg("--emulate")
         .arg("--data-dir")
         .arg(data_dir);
     for disk in disks {
-        client_cmd.arg("--disk").arg(disk);
+        vmctl_cmd.arg("--disk").arg(disk);
     }
-    let mut child = client_cmd.arg("--").args(cmd).spawn().unwrap();
+    let mut child = vmctl_cmd.arg("--").args(cmd).spawn().unwrap();
 
     let mut stdin = child.stdin.take().unwrap();
     if let Some(stdin_value) = stdin_value {
         let _ = stdin.write_all(stdin_value.as_bytes());
     }
-    // Close the pipe, otherwise the client never sees stdin EOF
+    // Close the pipe, otherwise the vmctl never sees stdin EOF
     drop(stdin);
 
     wait_with_timeout(child, "qemu")

@@ -4,7 +4,7 @@ use common::{OutputExt, command};
 use std::{ffi::OsStr, io::Write, path::Path, process::Output, thread, time::Duration};
 use tempdir::TempDir;
 
-const CLIENT: &str = env!("CARGO_BIN_EXE_client");
+const VMCTL: &str = env!("CARGO_BIN_EXE_vmctl");
 const SERVER: &str = env!("CARGO_BIN_EXE_server");
 
 #[test]
@@ -32,7 +32,7 @@ fn redirecting_stdin() {
 /// `run` at a root filesystem.
 #[test]
 fn run_rejects_data_dir_with_root_fs() {
-    command(CLIENT)
+    command(VMCTL)
         .args(["run", "--data-dir", "vm", "--root-fs", "rootfs.qcow2"])
         .output()
         .unwrap()
@@ -59,7 +59,7 @@ fn run_tty_test(args: &[impl AsRef<OsStr>], stdin_value: Option<&str>) -> Output
 /// Spawn the server on a tty in a temp directory and connect the client to it
 /// with the given client arguments.
 fn run_tty_test_via(
-    client_args: &[&str],
+    vmctl_args: &[&str],
     args: &[impl AsRef<OsStr>],
     stdin_value: Option<&str>,
 ) -> Output {
@@ -81,8 +81,8 @@ fn run_tty_test_via(
 
     wait_for_path(tmp_dir.path().join("tty"));
 
-    let mut child = command(CLIENT)
-        .args(client_args)
+    let mut child = command(VMCTL)
+        .args(vmctl_args)
         .current_dir(tmp_dir.path())
         .spawn()
         .unwrap();
@@ -94,10 +94,10 @@ fn run_tty_test_via(
     // We need to close stdin, so that commands that reads it gets EOF
     drop(stdin);
 
-    let client_out = child.wait_with_output().unwrap();
-    client_out.assert_success();
+    let vmctl_out = child.wait_with_output().unwrap();
+    vmctl_out.assert_success();
     server_out.join().unwrap().unwrap().assert_success();
-    client_out
+    vmctl_out
 }
 
 fn wait_for_path(path: impl AsRef<Path>) {

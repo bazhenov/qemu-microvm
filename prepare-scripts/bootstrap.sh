@@ -22,7 +22,7 @@ fi
 
 SYSFS_IMAGE=alpine
 SYSFS=images/sysfs.qcow2
-VMCTL=target/release/client
+VMCTL=target/release/vmctl
 ALPINE_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz
 
 cargo build --release

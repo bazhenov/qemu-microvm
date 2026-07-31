@@ -4,14 +4,14 @@
 //!
 //! - `init` — set up a new VM environment: clone the root filesystem image
 //!   into the data directory (`./.vm` by default).
-//! - `run-vm` — boot a VM from a root filesystem image (`--root-fs`): a
+//! - `qemu` — boot a VM from a root filesystem image (`--root-fs`): a
 //!   glorified QEMU wrapper that runs in the foreground until the VM shuts
 //!   down and exposes the guest server over a serial pty (`--serial`).
 //! - `shell` — attach the local terminal to a running VM's serial pty: put
 //!   the terminal in raw mode and bridge it to the server over the framed
 //!   channel: keystrokes ride endpoint 0, the shell's stdout/stderr come back
 //!   on endpoints 1/2, and SIGWINCH is forwarded as resize frames.
-//! - `run` — the two above combined: spawn `run-vm` and `shell` as child
+//! - `run` — the two above combined: spawn `qemu` and `shell` as child
 //!   processes and report the shell's exit code (the code of the command that
 //!   ran in the guest).
 //!
@@ -54,8 +54,8 @@ enum Cmd {
     Init(InitArgs),
     /// Run a VM from an already initialized data directory and attach a shell to it
     Run(RunArgs),
-    /// Boot a VM under QEMU from a root filesystem image
-    RunVm(RunVmArgs),
+    /// Run a QEMU VM
+    Qemu(QemuArgs),
     /// Attach the local terminal to a running VM over its serial pty
     Shell(ShellArgs),
 }
@@ -88,7 +88,7 @@ struct RunArgs {
 }
 
 #[derive(Args, Debug)]
-/// options common to both `run` and `run-vm` subcommands
+/// options common to both `run` and `qemu` subcommands
 struct CommonVmArgs {
     /// Dump VM boot logs to the stdout
     #[arg(long = "boot-log")]
@@ -116,13 +116,13 @@ struct CommonVmArgs {
     cores: u16,
 
     /// Command to run in the VM instead of the default login shell
-    /// (e.g. `client run-vm --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
+    /// (e.g. `vmctl qemu --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
     #[arg(last = true, name = "command")]
     command: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-struct RunVmArgs {
+struct QemuArgs {
     /// Root filesystem disk image booted read-write as /dev/vda
     /// (format inferred from the extension: .qcow2 — qcow2, anything else — raw)
     #[arg(long = "root-fs", value_name = "disk")]
@@ -138,7 +138,7 @@ struct RunVmArgs {
 
 #[derive(Args, Debug)]
 struct ShellArgs {
-    /// Serial pty of a running VM (created by `run-vm --serial`)
+    /// Serial pty of a running VM (created by `qemu --serial`)
     #[arg(long = "serial", value_name = "path")]
     serial: PathBuf,
 }
@@ -147,7 +147,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Init(args) => init_cmd(args),
         Cmd::Run(args) => run_cmd(args),
-        Cmd::RunVm(args) => run_vm_cmd(args),
+        Cmd::Qemu(args) => run_vm_cmd(args),
         Cmd::Shell(args) => shell_cmd(args),
     }
 }
@@ -215,12 +215,12 @@ fn run_cmd(args: RunArgs) -> ExitCode {
 }
 
 /// Orchestrate a full VM session out of the two other subcommands, each in
-/// its own child process: `run-vm` boots QEMU with the serial pty in a
+/// its own child process: `qemu` boots QEMU with the serial pty in a
 /// private temp directory, `shell` bridges the local terminal to it. The
 /// shell's exit code (the code of the command that ran in the guest) becomes
 /// our own.
 fn run_env(args: RunArgs) -> io::Result<ExitCode> {
-    let client_exe = env::current_exe()?;
+    let vmctl = env::current_exe()?;
 
     // An explicit rootfs image wins over the data directory
     let root_fs = match args.root_fs {
@@ -229,7 +229,7 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
             Some(root_fs) => root_fs,
             None => {
                 eprintln!(
-                    "run: VM environment is not initialized in {}, run `client init` first",
+                    "run: VM environment is not initialized in {}, run `vmctl init` first",
                     args.data_dir.display()
                 );
                 return Ok(ExitCode::FAILURE);
@@ -242,9 +242,9 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
     let private_dir = TempDir::new("vm")?;
     let serial_path = private_dir.path().join("vm-server");
 
-    let mut vm_cmd = Command::new(&client_exe);
+    let mut vm_cmd = Command::new(&vmctl);
     vm_cmd
-        .arg("run-vm")
+        .arg("qemu")
         .arg("--root-fs")
         .arg(&root_fs)
         .arg("--serial")
@@ -284,7 +284,7 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         thread::sleep(Duration::from_millis(10));
     }
 
-    let shell_status = Command::new(client_exe)
+    let shell_status = Command::new(vmctl)
         .arg("shell")
         .arg("--serial")
         .arg(serial_path)
@@ -308,7 +308,7 @@ fn propagate_status(status: ExitStatus) -> ExitCode {
     }
 }
 
-fn run_vm_cmd(args: RunVmArgs) -> ! {
+fn run_vm_cmd(args: QemuArgs) -> ! {
     let opts = VmLaunchOpts {
         dump_boot_log: args.vm.dump_boot_log,
         serial_path: args.serial,
@@ -330,7 +330,7 @@ fn shell_cmd(args: ShellArgs) -> ExitCode {
         Ok(Some(code)) => ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX)),
         Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("client: {e}");
+            eprintln!("vmctl: {e}");
             ExitCode::FAILURE
         }
     }
