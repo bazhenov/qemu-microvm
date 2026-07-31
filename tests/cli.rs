@@ -53,7 +53,7 @@ fn shell_subcommand() {
 }
 
 fn run_tty_test(args: &[impl AsRef<OsStr>], stdin_value: Option<&str>) -> Output {
-    run_tty_test_via(&["run", "--serial", "./tty"], args, stdin_value)
+    run_tty_test_via(&["shell", "--serial", "./tty"], args, stdin_value)
 }
 
 /// Spawn the server on a tty in a temp directory and connect the client to it

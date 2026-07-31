@@ -1,5 +1,6 @@
 use std::{
     env, io,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -61,13 +62,6 @@ pub struct VmLaunchOpts {
 ///
 /// Paths are relative to the current working directory.
 pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
-    if !opts.root_fs.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("root fs image not found: {}", opts.root_fs.display()),
-        ));
-    }
-
     // -virtfs local,path=$PWD,... — share the current working directory over 9p.
     let pwd = env::current_dir()?;
     let virtfs = format!(
@@ -134,6 +128,16 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         ]);
     }
 
+    // Check before exec'ing: QEMU creates the serial pty (and its symlink)
+    // before opening the drives, so a boot doomed by a missing root fs would
+    // still briefly expose a pty that `run` mistakes for a running VM.
+    if !opts.root_fs.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root fs image not found: {}", opts.root_fs.display()),
+        ));
+    }
+
     qemu_cmd
         // Root disk drive.
         .args([
@@ -191,17 +195,8 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         qemu_cmd.stderr(Stdio::piped()).stdout(Stdio::piped());
     }
 
-    let mut qemu = qemu_cmd.spawn()?;
-    let _ = qemu.stderr.take();
-    let _ = qemu.stdin.take();
-    let output = qemu.wait_with_output()?;
-    if !output.status.success() {
-        Err(io::Error::other(
-            "VM failed, use --boot-log to inspect details",
-        ))
-    } else {
-        Ok(())
-    }
+    // exec() never returns
+    panic!("{}", qemu_cmd.exec())
 }
 
 fn disk_format(path: &Path) -> &'static str {

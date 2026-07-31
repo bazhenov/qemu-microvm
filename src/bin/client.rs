@@ -78,15 +78,18 @@ struct RunArgs {
     #[arg(long = "data-dir", value_name = "dir", default_value = DEFAULT_DATA_DIR, conflicts_with = "root_fs")]
     data_dir: PathBuf,
 
-    /// Root filesystem disk image booted directly (read-write) instead of
-    /// the rootfs from an initialized data directory
+    /// Root filesystem disk image booted read-write as /dev/vda
+    /// (format inferred from the extension: .qcow2 — qcow2, anything else — raw)
     #[arg(long = "root-fs", value_name = "disk")]
     root_fs: Option<PathBuf>,
 
-    /// If specified no VM will be launched automatically. Instead client will connect to a given pty
-    #[arg(long = "serial", value_name = "path")]
-    serial: Option<PathBuf>,
+    #[clap(flatten)]
+    vm: CommonVmArgs,
+}
 
+#[derive(Args, Debug)]
+/// options common to both `run` and `run-vm` subcommands
+struct CommonVmArgs {
     /// Dump VM boot logs to the stdout
     #[arg(long = "boot-log")]
     dump_boot_log: bool,
@@ -99,21 +102,21 @@ struct RunArgs {
     #[arg(long = "emulate")]
     emulate: bool,
 
-    /// Amount of memory in VM in megabytes
-    #[arg(long = "memory", default_value_t = 512)]
-    memory_megs: u32,
-
-    /// Amount of memory in VM in megabytes
-    #[arg(long = "cores", default_value_t = 1)]
-    cores: u16,
-
     /// Attach an additional disk image to the VM (may be given multiple times).
     /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
     #[arg(long = "disk", name = "disk")]
     additional_disks: Vec<PathBuf>,
 
+    /// Amount of memory in VM in megabytes
+    #[arg(long = "memory", default_value_t = 512)]
+    memory_megs: u32,
+
+    /// Number of cores
+    #[arg(long = "cores", default_value_t = 1)]
+    cores: u16,
+
     /// Command to run in the VM instead of the default login shell
-    /// (e.g. `client run -- /bin/sh -c 'uname -a'`)
+    /// (e.g. `client run-vm --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
     #[arg(last = true, name = "command")]
     command: Vec<String>,
 }
@@ -129,35 +132,8 @@ struct RunVmArgs {
     #[arg(long = "serial", value_name = "path")]
     serial: PathBuf,
 
-    /// Dump VM boot logs to the stdout
-    #[arg(long = "boot-log")]
-    dump_boot_log: bool,
-
-    /// Run VM init in a recovery mode
-    #[arg(long = "recovery")]
-    recovery: bool,
-
-    /// Run in emulation mode (without using hypervisor)
-    #[arg(long = "emulate")]
-    emulate: bool,
-
-    /// Attach an additional disk image to the VM (may be given multiple times).
-    /// Disks appear in the guest as /dev/vdb, /dev/vdc, ... in the given order
-    #[arg(long = "disk", name = "disk")]
-    additional_disks: Vec<PathBuf>,
-
-    /// Amount of memory in VM in megabytes
-    #[arg(long = "memory", default_value_t = 512)]
-    memory_megs: u32,
-
-    /// Amount of memory in VM in megabytes
-    #[arg(long = "cores", default_value_t = 1)]
-    cores: u16,
-
-    /// Command to run in the VM instead of the default login shell
-    /// (e.g. `client run-vm --root-fs rootfs.qcow2 --serial pty -- /bin/sh -c 'uname -a'`)
-    #[arg(last = true, name = "command")]
-    command: Vec<String>,
+    #[clap(flatten)]
+    vm: CommonVmArgs,
 }
 
 #[derive(Args, Debug)]
@@ -246,14 +222,7 @@ fn run_cmd(args: RunArgs) -> ExitCode {
 fn run_env(args: RunArgs) -> io::Result<ExitCode> {
     let client_exe = env::current_exe()?;
 
-    // With an explicit serial path there is no VM to launch, only the shell.
-    if let Some(serial) = args.serial {
-        let status = spawn_shell(&client_exe, &serial)?;
-        return Ok(propagate_status(status));
-    }
-
-    // An explicit rootfs image wins over the data directory (the two options
-    // are mutually exclusive on the command line).
+    // An explicit rootfs image wins over the data directory
     let root_fs = match args.root_fs {
         Some(root_fs) => root_fs,
         None => match find_root_fs(&args.data_dir) {
@@ -281,25 +250,25 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         .arg("--serial")
         .arg(&serial_path)
         .arg("--memory")
-        .arg(format!("{}", args.memory_megs))
+        .arg(format!("{}", args.vm.memory_megs))
         .arg("--cores")
-        .arg(format!("{}", args.cores))
+        .arg(format!("{}", args.vm.cores))
         // The VM never reads our stdin, it belongs to the shell.
         .stdin(Stdio::null());
-    if args.dump_boot_log {
+    if args.vm.dump_boot_log {
         vm_cmd.arg("--boot-log");
     }
-    if args.recovery {
+    if args.vm.recovery {
         vm_cmd.arg("--recovery");
     }
-    if args.emulate {
+    if args.vm.emulate {
         vm_cmd.arg("--emulate");
     }
-    for disk in &args.additional_disks {
+    for disk in &args.vm.additional_disks {
         vm_cmd.arg("--disk").arg(disk);
     }
-    if !args.command.is_empty() {
-        vm_cmd.arg("--").args(&args.command);
+    if !args.vm.command.is_empty() {
+        vm_cmd.arg("--").args(&args.vm.command);
     }
     let mut vm = vm_cmd.spawn()?;
 
@@ -308,9 +277,11 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         if vm.try_wait()?.is_some() {
             // VM failed before exposing the serial pty; its own stderr
             // (inherited) already explains why.
-            return Ok(ExitCode::FAILURE);
+            return Err(io::Error::other(
+                "VM failed, use --boot-log to inspect details",
+            ));
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(10));
     }
 
     let shell_status = Command::new(client_exe)
@@ -318,17 +289,14 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         .arg("--serial")
         .arg(serial_path)
         .status()?;
-    let _ = vm.wait();
-    Ok(propagate_status(shell_status))
-}
-
-/// Run `client shell --serial <serial>` with inherited stdio and wait for it.
-fn spawn_shell(client_exe: &Path, serial: &Path) -> io::Result<ExitStatus> {
-    Command::new(client_exe)
-        .arg("shell")
-        .arg("--serial")
-        .arg(serial)
-        .status()
+    let vm_status = vm.wait()?;
+    if !vm_status.success() {
+        Ok(propagate_status(vm_status))
+    } else if !shell_status.success() {
+        Ok(propagate_status(shell_status))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 /// Turn a child's exit status into our own exit code (killed by a signal
@@ -342,15 +310,15 @@ fn propagate_status(status: ExitStatus) -> ExitCode {
 
 fn run_vm_cmd(args: RunVmArgs) -> ExitCode {
     let opts = VmLaunchOpts {
-        dump_boot_log: args.dump_boot_log,
+        dump_boot_log: args.vm.dump_boot_log,
         serial_path: args.serial,
-        recovery: args.recovery,
+        recovery: args.vm.recovery,
         root_fs: args.root_fs,
-        emulate: args.emulate,
-        command: args.command,
-        cores: args.cores,
-        memory_megs: args.memory_megs,
-        additional_disks: args.additional_disks,
+        emulate: args.vm.emulate,
+        command: args.vm.command,
+        cores: args.vm.cores,
+        memory_megs: args.vm.memory_megs,
+        additional_disks: args.vm.additional_disks,
     };
     match qemu::launch_vm(opts) {
         Ok(()) => ExitCode::SUCCESS,

@@ -76,6 +76,33 @@ fn run_with_explicit_root_fs() {
         .assert_stdout_match("running in sandbox\n");
 }
 
+/// If QEMU fails for whatever reason, stderr output should contain mention of --boot-log option
+///
+/// Regression note: the missing root fs must be rejected *before* QEMU is
+/// exec'd. QEMU sets up the serial pty (and its symlink) before opening the
+/// drives, so a doomed boot used to briefly expose a pty that `run` mistook
+/// for a running VM; the shell then attached to a pty number the OS had
+/// already recycled for another VM, corrupting that VM's frame stream. This
+/// made parallel e2e runs flaky (this test failed together with one random
+/// victim test).
+#[test]
+fn boot_log_mention() {
+    let tmp_dir = TempDir::new("vm-env").unwrap();
+    let child = client()
+        .current_dir(tmp_dir.path())
+        .args([
+            "run",
+            "--emulate",
+            "--root-fs",
+            "./not-existent-root-fs.qcow2",
+        ])
+        .spawn()
+        .unwrap();
+    wait_with_timeout(child, "qemu")
+        .assert_failure()
+        .assert_stderr_contains("--boot-log");
+}
+
 #[test]
 fn md5sum_in_vm() {
     let tmp = TempDir::new("vm-env").unwrap();
