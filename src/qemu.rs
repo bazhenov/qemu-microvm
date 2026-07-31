@@ -1,5 +1,5 @@
 use std::{
-    env, io,
+    io,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -53,22 +53,11 @@ pub struct VmLaunchOpts {
     pub additional_disks: Vec<PathBuf>,
 }
 
-/// Launch the microVM under QEMU
-///
-///   1. remove the stale `./console` pty symlink,
-///   2. `exec` qemu-system-aarch64 with the full device set
-///      (aarch64/HVF, virtio-serial console + data port, virtio-blk root,
-///      user-mode net, RNG, a 9p share of the cwd, kernel + initrd).
+/// Launch the microVM under QEMU. This method executes VM in a current process by substituding it
+/// with QEMU process
 ///
 /// Paths are relative to the current working directory.
-pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
-    // -virtfs local,path=$PWD,... — share the current working directory over 9p.
-    let pwd = env::current_dir()?;
-    let virtfs = format!(
-        "local,path={},mount_tag=qemu,security_model=mapped",
-        pwd.display()
-    );
-
+pub fn exec_vm(opts: VmLaunchOpts) -> ! {
     let mut kernel_opts = vec![
         "console=hvc0".to_string(),
         "reboot=t".to_string(),
@@ -79,7 +68,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         kernel_opts.push("init_recovery=1".to_string());
     }
 
-    if let Some(value) = format_init_args(&opts)? {
+    if let Some(value) = format_init_args(&opts).unwrap() {
         kernel_opts.push("--".to_string());
         kernel_opts.push(value);
     }
@@ -111,10 +100,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
     // Additional disk drives (guest sees them as /dev/vdb, /dev/vdc, ...).
     for (idx, disk) in opts.additional_disks.iter().enumerate() {
         if !disk.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("disk image not found: {}", disk.display()),
-            ));
+            panic!("disk image not found: {}", disk.display());
         }
         let format = disk_format(disk);
         qemu_cmd.args([
@@ -132,10 +118,7 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
     // before opening the drives, so a boot doomed by a missing root fs would
     // still briefly expose a pty that `run` mistakes for a running VM.
     if !opts.root_fs.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("root fs image not found: {}", opts.root_fs.display()),
-        ));
+        panic!("root fs image not found: {}", opts.root_fs.display());
     }
 
     qemu_cmd
@@ -184,8 +167,6 @@ pub fn launch_vm(opts: VmLaunchOpts) -> io::Result<()> {
         .args(["-rtc", "base=utc,clock=host"])
         // RNG support
         .args(["-device", "virtio-rng-pci"])
-        // VirtIO FS share — path is computed at runtime, so pass it separately
-        .args(["-virtfs", &virtfs])
         // Linux kernel settings
         .args(["-kernel", LINUX_KERNEL, "-initrd", "./target/initrd.gz"])
         .args(["-append", &kernel_opts])
@@ -209,7 +190,7 @@ fn disk_format(path: &Path) -> &'static str {
 /// init arguments are by convention passed after `--` in the kernel args line
 ///
 /// This method formats this arguments line. Result does not contains `--` separate itself
-fn format_init_args(opts: &VmLaunchOpts) -> Result<Option<String>, io::Error> {
+fn format_init_args(opts: &VmLaunchOpts) -> io::Result<Option<String>> {
     if opts.command.is_empty() {
         Ok(None)
     } else {

@@ -308,7 +308,7 @@ fn propagate_status(status: ExitStatus) -> ExitCode {
     }
 }
 
-fn run_vm_cmd(args: RunVmArgs) -> ExitCode {
+fn run_vm_cmd(args: RunVmArgs) -> ! {
     let opts = VmLaunchOpts {
         dump_boot_log: args.vm.dump_boot_log,
         serial_path: args.serial,
@@ -320,13 +320,7 @@ fn run_vm_cmd(args: RunVmArgs) -> ExitCode {
         memory_megs: args.vm.memory_megs,
         additional_disks: args.vm.additional_disks,
     };
-    match qemu::launch_vm(opts) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("run-vm: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    qemu::exec_vm(opts)
 }
 
 fn shell_cmd(args: ShellArgs) -> ExitCode {
