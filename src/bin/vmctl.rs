@@ -107,6 +107,14 @@ struct CommonVmArgs {
     #[arg(long = "disk", name = "disk")]
     additional_disks: Vec<PathBuf>,
 
+    /// Linux kernel image booted in the VM
+    #[arg(long = "kernel", value_name = "path", default_value = qemu::DEFAULT_KERNEL)]
+    kernel: PathBuf,
+
+    /// Initrd image handed to the kernel
+    #[arg(long = "initrd", value_name = "path", default_value = qemu::DEFAULT_INITRD)]
+    initrd: PathBuf,
+
     /// Amount of memory in VM in megabytes
     #[arg(long = "memory", default_value_t = 512)]
     memory_megs: u32,
@@ -253,6 +261,10 @@ fn run_env(args: RunArgs) -> io::Result<ExitCode> {
         .arg(format!("{}", args.vm.memory_megs))
         .arg("--cores")
         .arg(format!("{}", args.vm.cores))
+        .arg("--kernel")
+        .arg(&args.vm.kernel)
+        .arg("--initrd")
+        .arg(&args.vm.initrd)
         // The VM never reads our stdin, it belongs to the shell.
         .stdin(Stdio::null());
     if args.vm.dump_boot_log {
@@ -314,6 +326,8 @@ fn run_vm_cmd(args: QemuArgs) -> ! {
         serial_path: args.serial,
         recovery: args.vm.recovery,
         root_fs: args.root_fs,
+        kernel: args.vm.kernel,
+        initrd: args.vm.initrd,
         emulate: args.vm.emulate,
         command: args.vm.command,
         cores: args.vm.cores,

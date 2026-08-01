@@ -5,7 +5,11 @@ use std::{
     process::{Command, Stdio},
 };
 
-const LINUX_KERNEL: &str = "./linux/arch/arm64/boot/Image";
+/// Default Linux kernel image path (see `Makefile` for how it is built).
+pub const DEFAULT_KERNEL: &str = "./linux/arch/arm64/boot/Image";
+
+/// Default initrd image path (built by `make ./target/initrd.gz`).
+pub const DEFAULT_INITRD: &str = "./target/initrd.gz";
 
 pub struct VmLaunchOpts {
     /// If true stdout/stderr of VM process will be linked to current
@@ -35,6 +39,12 @@ pub struct VmLaunchOpts {
     /// with APFS `clonefile`/`cp -c`). Format is inferred from the file
     /// extension: `.qcow2` — qcow2, anything else — raw.
     pub root_fs: PathBuf,
+
+    /// Linux kernel image booted in the VM
+    pub kernel: PathBuf,
+
+    /// Initrd image handed to the kernel
+    pub initrd: PathBuf,
 
     /// If true, emulating mode is used, otherwise platform hypervisor is used
     pub emulate: bool,
@@ -120,6 +130,12 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
     if !opts.root_fs.exists() {
         panic!("root fs image not found: {}", opts.root_fs.display());
     }
+    if !opts.kernel.exists() {
+        panic!("kernel image not found: {}", opts.kernel.display());
+    }
+    if !opts.initrd.exists() {
+        panic!("initrd image not found: {}", opts.initrd.display());
+    }
 
     qemu_cmd
         // Root disk drive.
@@ -138,7 +154,7 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
             "-device",
             "virtio-net-device,netdev=net1",
             "-netdev",
-            "user,id=net1",
+            "user,id=net1,ipv6=off",
         ])
         // It's important to serial devices to be configured last (console and host pty).
         // We rely on device index (eg vport0p1) to connect VM to host, and devices enumerated by Linux/QEMU
@@ -168,7 +184,10 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
         // RNG support
         .args(["-device", "virtio-rng-pci"])
         // Linux kernel settings
-        .args(["-kernel", LINUX_KERNEL, "-initrd", "./target/initrd.gz"])
+        .arg("-kernel")
+        .arg(&opts.kernel)
+        .arg("-initrd")
+        .arg(&opts.initrd)
         .args(["-append", &kernel_opts])
         .stdin(Stdio::piped());
 

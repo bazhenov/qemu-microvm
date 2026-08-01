@@ -46,7 +46,10 @@ else
         # resolv.conf might be existing and might be a symlink, in which case we need to remove it first
         rm -f /mnt/etc/resolv.conf
         # 10.0.2.3 is a default DNS provided by QEMU user networking (eg. `-netdev user`)
-        echo "nameserver 10.0.2.3" > /mnt/etc/resolv.conf
+        # QEMU libslirp only uses 1st DNS resolver from host machine.
+        # If IPv6 stack is configured on a host machine it probably will have an IPv6 DNS server and it might
+        # cause DNS resolution issues. We add second DNS as a fallback.
+        echo -e "nameserver 10.0.2.3\nnameserver 8.8.8.8" > /mnt/etc/resolv.conf
     fi
 
     # From now on we do not care about exit code. We stee need to move on
