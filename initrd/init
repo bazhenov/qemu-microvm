@@ -13,11 +13,13 @@ mount -t devpts devpts /dev/pts
 # Disabling ipv6 networking stack for performance reasons (~1s overhead on startup)
 sysctl -q net.ipv6.conf.all.disable_ipv6=1
 
-# 10.0.2.15 is the IP address assigned automatically by QEMU to a VM
-# when using -nic user. (see: https://www.qemu.org/docs/master/system/devices/net.html)
+# Networking is provided by gvproxy (gvisor-tap-vsock) on the host side:
+# the VM is expected at 192.168.127.2, the host is reachable at
+# 192.168.127.254 and DNS is served by the gateway at 192.168.127.1
+# (see: https://github.com/containers/gvisor-tap-vsock)
 ip link set eth0 up
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
+ip addr add 192.168.127.2/24 dev eth0
+ip route add default via 192.168.127.254
 
 ip link set lo up
 hostname sandbox
@@ -45,11 +47,9 @@ else
     if [ -d /mnt/etc ]; then
         # resolv.conf might be existing and might be a symlink, in which case we need to remove it first
         rm -f /mnt/etc/resolv.conf
-        # 10.0.2.3 is a default DNS provided by QEMU user networking (eg. `-netdev user`)
-        # QEMU libslirp only uses 1st DNS resolver from host machine.
-        # If IPv6 stack is configured on a host machine it probably will have an IPv6 DNS server and it might
-        # cause DNS resolution issues. We add second DNS as a fallback.
-        echo -e "nameserver 10.0.2.3\nnameserver 8.8.8.8" > /mnt/etc/resolv.conf
+        # 192.168.127.1 is the DNS server built into gvproxy (it forwards
+        # queries to the host resolver). 8.8.8.8 is kept as a fallback.
+        echo -e "nameserver 192.168.127.1\nnameserver 8.8.8.8" > /mnt/etc/resolv.conf
     fi
 
     # From now on we do not care about exit code. We stee need to move on

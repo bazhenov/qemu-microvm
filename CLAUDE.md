@@ -39,8 +39,9 @@ The suite has three layers, which can be run separately:
 ### Prerequisites for the end-to-end tests
 
 - `qemu-system-aarch64` on `PATH`.
+- `gvproxy` (from [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)) on `PATH` — provides guest networking; `vmctl` spawns one instance per VM.
 - A compiled kernel at `./linux/arch/arm64/boot/Image`. Download/configure with `make` (see `Makefile`), then compile with `make -C linux -j$(nproc)` — kernel compilation must be done on Linux.
-- `./target/initrd.gz` — built by `make ./target/initrd.gz` (requires the `aarch64-unknown-linux-musl` Rust target and `cpio`).
+- `./target/initrd.gz` — built by `make ./target/initrd.gz` or `orb make target/initrd.gz` if you're on macOS.
 - `./images/sysfs.qcow2` — the base root filesystem image. Prepare it using `./prepare-scripts/prepare-rootfs.sh`
 
 If the kernel/initrd/rootfs artifacts are missing, only the e2e tests fail; unit and

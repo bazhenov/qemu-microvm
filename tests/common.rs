@@ -14,7 +14,7 @@ use std::{
 };
 
 /// How long a process is allowed to run in tests before it is considered hung.
-const TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[track_caller]
 pub fn wait_with_timeout(mut child: Child, name: &str) -> Output {

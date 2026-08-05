@@ -155,7 +155,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Init(args) => init_cmd(args),
         Cmd::Run(args) => run_cmd(args),
-        Cmd::Qemu(args) => run_vm_cmd(args),
+        Cmd::Qemu(args) => qemu_cmd(args),
         Cmd::Shell(args) => shell_cmd(args),
     }
 }
@@ -320,8 +320,17 @@ fn propagate_status(status: ExitStatus) -> ExitCode {
     }
 }
 
-fn run_vm_cmd(args: QemuArgs) -> ! {
-    let opts = VmLaunchOpts {
+fn qemu_cmd(args: QemuArgs) -> ExitCode {
+    // gvproxy provides the guest networking, one instance per VM
+    let (mut gvproxy, net_port) = match qemu::start_gvproxy(args.vm.dump_boot_log) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("qemu: failed to start gvproxy: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = qemu::run_vm(VmLaunchOpts {
         dump_boot_log: args.vm.dump_boot_log,
         serial_path: args.serial,
         recovery: args.vm.recovery,
@@ -333,8 +342,22 @@ fn run_vm_cmd(args: QemuArgs) -> ! {
         cores: args.vm.cores,
         memory_megs: args.vm.memory_megs,
         additional_disks: args.vm.additional_disks,
-    };
-    qemu::exec_vm(opts)
+        net_port,
+    });
+
+    // gvproxy exits on its own once the QEMU connection closes; the kill
+    // covers the paths where QEMU never connected (failed to spawn or died
+    // before opening the netdev), and makes reaping prompt otherwise.
+    let _ = gvproxy.kill();
+    let _ = gvproxy.wait();
+
+    match result {
+        Ok(status) => propagate_status(status),
+        Err(e) => {
+            eprintln!("qemu: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn shell_cmd(args: ShellArgs) -> ExitCode {

@@ -77,14 +77,6 @@ fn run_with_explicit_root_fs() {
 }
 
 /// If QEMU fails for whatever reason, stderr output should contain mention of --boot-log option
-///
-/// Regression note: the missing root fs must be rejected *before* QEMU is
-/// exec'd. QEMU sets up the serial pty (and its symlink) before opening the
-/// drives, so a doomed boot used to briefly expose a pty that `run` mistook
-/// for a running VM; the shell then attached to a pty number the OS had
-/// already recycled for another VM, corrupting that VM's frame stream. This
-/// made parallel e2e runs flaky (this test failed together with one random
-/// victim test).
 #[test]
 fn boot_log_mention() {
     let tmp_dir = TempDir::new("vm-env").unwrap();
@@ -177,6 +169,48 @@ fn should_respect_default_path_in_noninteractive_mode() {
         .assert_stdout_contains("USER=root");
 }
 
+/// L3 connectivity to the gvproxy virtual switch (192.168.127.1 is the only
+/// address it answers ICMP echo on). Runs in recovery mode, so only the
+/// initrd network setup is exercised (no rootfs mounts). Does not need
+/// internet access on the host.
+#[test]
+fn gateway_l3_connectivity() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    run_in_recovery_vm(&data_dir, &["ping", "-c1", "-W2", "192.168.127.1"])
+        .assert_success()
+        .assert_stdout_contains("1 packets received");
+}
+
+/// L3 connectivity to the outside world through gvproxy. The `internet_`
+/// prefix marks tests that legitimately fail on a machine without internet
+/// access.
+#[test]
+fn internet_l3_connectivity() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    run_in_recovery_vm(&data_dir, &["/bin/sh", "-c", "ping -c1 -W2 1.1.1.1"])
+        .assert_success()
+        .assert_stdout_contains("1 packets received");
+}
+
+/// DNS resolution through gvproxy's built-in resolver. The `internet_` prefix marks
+/// tests that legitimately fail on a machine without internet access.
+#[test]
+fn internet_dns_resolution() {
+    let tmp = TempDir::new("vm-env").unwrap();
+    let data_dir = tmp.path().join("vm");
+    init_env(&data_dir);
+
+    run_in_vm(&data_dir, &[], None, &["nslookup", "example.com"])
+        .assert_success()
+        .assert_stdout_contains("Name:{..}example.com");
+}
+
 #[test]
 fn propagate_exit_status() {
     let tmp = TempDir::new("vm-env").unwrap();
@@ -207,12 +241,31 @@ fn init_env(data_dir: &Path) {
 /// Run `cmd` in a VM booted from the `data_dir` environment and return its
 /// output.
 fn run_in_vm(data_dir: &Path, disks: &[&Path], stdin_value: Option<&str>, cmd: &[&str]) -> Output {
+    run_in_vm_impl(data_dir, disks, stdin_value, false, cmd)
+}
+
+/// Same as [`run_in_vm`], but the guest init stays in recovery mode: the
+/// command runs straight from the initrd, the rootfs is never mounted.
+fn run_in_recovery_vm(data_dir: &Path, cmd: &[&str]) -> Output {
+    run_in_vm_impl(data_dir, &[], None, true, cmd)
+}
+
+fn run_in_vm_impl(
+    data_dir: &Path,
+    disks: &[&Path],
+    stdin_value: Option<&str>,
+    recovery: bool,
+    cmd: &[&str],
+) -> Output {
     let mut vmctl_cmd = vmctl();
     vmctl_cmd
         .arg("run")
         .arg("--emulate")
         .arg("--data-dir")
         .arg(data_dir);
+    if recovery {
+        vmctl_cmd.arg("--recovery");
+    }
     for disk in disks {
         vmctl_cmd.arg("--disk").arg(disk);
     }

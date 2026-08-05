@@ -1,9 +1,11 @@
 use std::{
-    io,
-    os::unix::process::CommandExt,
+    io::{self, BufRead, BufReader},
+    net::TcpListener,
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
 };
+use tempdir::TempDir;
 
 /// Default Linux kernel image path (see `Makefile` for how it is built).
 pub const DEFAULT_KERNEL: &str = "./linux/arch/arm64/boot/Image";
@@ -52,7 +54,7 @@ pub struct VmLaunchOpts {
     /// Command to run in the VM instead of the default login shell.
     ///
     /// Passed to the guest init through the kernel command line (everything
-    /// after `--` is handed to init as its arguments). Ignored in recovery mode.
+    /// after `--` is handed to init as its arguments).
     pub command: Vec<String>,
 
     /// Additional disk images attached to the VM as virtio-blk devices.
@@ -61,13 +63,17 @@ pub struct VmLaunchOpts {
     /// (`/dev/vdb`, `/dev/vdc`, ...). Format is inferred from the file
     /// extension: `.qcow2` — qcow2, anything else — raw.
     pub additional_disks: Vec<PathBuf>,
+
+    /// Localhost TCP port the guest NIC backend connects to. A gvproxy
+    /// instance must already be listening on it (see [`start_gvproxy`]).
+    pub net_port: u16,
 }
 
-/// Launch the microVM under QEMU. This method executes VM in a current process by substituding it
-/// with QEMU process
+/// Launch the microVM under QEMU and wait for it to exit, returning its exit
+/// status
 ///
 /// Paths are relative to the current working directory.
-pub fn exec_vm(opts: VmLaunchOpts) -> ! {
+pub fn run_vm(opts: VmLaunchOpts) -> io::Result<ExitStatus> {
     let mut kernel_opts = vec![
         "console=hvc0".to_string(),
         "reboot=t".to_string(),
@@ -78,7 +84,7 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
         kernel_opts.push("init_recovery=1".to_string());
     }
 
-    if let Some(value) = format_init_args(&opts).unwrap() {
+    if let Some(value) = format_init_args(&opts.command)? {
         kernel_opts.push("--".to_string());
         kernel_opts.push(value);
     }
@@ -109,9 +115,7 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
 
     // Additional disk drives (guest sees them as /dev/vdb, /dev/vdc, ...).
     for (idx, disk) in opts.additional_disks.iter().enumerate() {
-        if !disk.exists() {
-            panic!("disk image not found: {}", disk.display());
-        }
+        ensure_exists(disk, "disk image")?;
         let format = disk_format(disk);
         qemu_cmd.args([
             "-drive",
@@ -124,18 +128,12 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
         ]);
     }
 
-    // Check before exec'ing: QEMU creates the serial pty (and its symlink)
+    // Check before spawning QEMU: it creates the serial pty (and its symlink)
     // before opening the drives, so a boot doomed by a missing root fs would
     // still briefly expose a pty that `run` mistakes for a running VM.
-    if !opts.root_fs.exists() {
-        panic!("root fs image not found: {}", opts.root_fs.display());
-    }
-    if !opts.kernel.exists() {
-        panic!("kernel image not found: {}", opts.kernel.display());
-    }
-    if !opts.initrd.exists() {
-        panic!("initrd image not found: {}", opts.initrd.display());
-    }
+    ensure_exists(&opts.root_fs, "root fs image")?;
+    ensure_exists(&opts.kernel, "kernel image")?;
+    ensure_exists(&opts.initrd, "initrd image")?;
 
     qemu_cmd
         // Root disk drive.
@@ -149,12 +147,12 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
             "-device",
             "virtio-blk-device,drive=root",
         ])
-        // Network (user-mode networking).
+        // Network: gvproxy is already listening on this port.
         .args([
             "-device",
             "virtio-net-device,netdev=net1",
             "-netdev",
-            "user,id=net1,ipv6=off",
+            &format!("socket,id=net1,connect=127.0.0.1:{}", opts.net_port),
         ])
         // It's important to serial devices to be configured last (console and host pty).
         // We rely on device index (eg vport0p1) to connect VM to host, and devices enumerated by Linux/QEMU
@@ -189,14 +187,101 @@ pub fn exec_vm(opts: VmLaunchOpts) -> ! {
         .arg("-initrd")
         .arg(&opts.initrd)
         .args(["-append", &kernel_opts])
-        .stdin(Stdio::piped());
+        // The guest console rides the serial pty, QEMU's own stdin is unused
+        .stdin(Stdio::null());
 
     if !opts.dump_boot_log {
-        qemu_cmd.stderr(Stdio::piped()).stdout(Stdio::piped());
+        qemu_cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
 
-    // exec() never returns
-    panic!("{}", qemu_cmd.exec())
+    qemu_cmd.spawn()?.wait()
+}
+
+/// [`io::ErrorKind::NotFound`] with a readable message unless `path` exists
+fn ensure_exists(path: &Path, what: &str) -> io::Result<()> {
+    if path.exists() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{what} not found: {}", path.display()),
+        ))
+    }
+}
+
+/// Spawn gvproxy on a random localhost TCP port and wait until it is
+/// ready to accept the QEMU connection, returning the process and the port
+/// (for [`VmLaunchOpts::net_port`]).
+///
+/// Readiness is reported by gvproxy itself: it connects to a unix socket we
+/// listen on (`-notification`) and sends a `{"notification_type":"ready"}`
+/// json message once its qemu endpoint is accepting connections.
+///
+/// gvproxy exits on its own as soon as the QEMU connection closes; still the
+/// caller should kill/reap the returned child once the VM is done — that
+/// covers the paths where QEMU never connected (failed to spawn or died
+/// before opening the netdev), and makes reaping prompt otherwise.
+///
+/// With `debug` gvproxy logs verbosely to the inherited stderr, otherwise its
+/// output is discarded.
+pub fn start_gvproxy(debug: bool) -> io::Result<(Child, u16)> {
+    // Let the OS pick a free port. Technically racy (the port is released
+    // before gvproxy binds it), but if the port gets stolen gvproxy just
+    // fails to bind and the wait below reports it.
+    let port = TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+
+    // The socket (and its directory) lives only for the duration of the
+    // handshake; gvproxy keeps writing notifications to the connected end,
+    // but nobody is listening anymore and gvproxy is fine with that.
+    let notify_dir = TempDir::new("gvproxy")?;
+    let notify_path = notify_dir.path().join("notify.sock");
+    let notify = UnixListener::bind(&notify_path)?;
+
+    let mut cmd = Command::new("gvproxy");
+    cmd.arg("-listen-qemu")
+        .arg(format!("tcp://127.0.0.1:{port}"))
+        .arg("-notification")
+        .arg(format!("unix://{}", notify_path.display()))
+        // By default gvproxy forwards host port 2222 to the guest's SSH port;
+        // that fixed port would allow only one VM at a time, so disable it.
+        .args(["-ssh-port", "-1"])
+        .stdin(Stdio::null());
+    if debug {
+        cmd.arg("-debug");
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot spawn gvproxy (is it on PATH?): {e}"),
+        )
+    })?;
+
+    match wait_until_gvproxy_report_ready(notify) {
+        Ok(()) => Ok((child, port)),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
+        }
+    }
+}
+
+fn wait_until_gvproxy_report_ready(notify: UnixListener) -> io::Result<()> {
+    let (stream, _) = notify.accept()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::other("gvproxy closed the notification socket"));
+        }
+        // The message we are waiting for is `{"notification_type":"ready"}`
+        if line.contains("\"ready\"") {
+            return Ok(());
+        }
+    }
 }
 
 fn disk_format(path: &Path) -> &'static str {
@@ -209,12 +294,12 @@ fn disk_format(path: &Path) -> &'static str {
 /// init arguments are by convention passed after `--` in the kernel args line
 ///
 /// This method formats this arguments line. Result does not contains `--` separate itself
-fn format_init_args(opts: &VmLaunchOpts) -> io::Result<Option<String>> {
-    if opts.command.is_empty() {
+fn format_init_args(command: &[String]) -> io::Result<Option<String>> {
+    if command.is_empty() {
         Ok(None)
     } else {
         let mut args_line = String::new();
-        for (idx, arg) in opts.command.iter().enumerate() {
+        for (idx, arg) in command.iter().enumerate() {
             if arg.contains('"') {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
